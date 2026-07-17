@@ -1,3 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+
+# Coverage
+.coverage
+coverage.xml
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Temp files
+results/
+exports_our/
+
 /exports/results_per_algorithm/xgb/models/xgb_benchmark_acc_hrv_EDR_3stage.obj
 /exports/results_per_algorithm/xgb/models/xgb_benchmark_acc_hrv_EDR_5stage.obj
 /exports/results_per_algorithm/xgb/models/xgb_benchmark_acc_hrv_EDR_binary.obj

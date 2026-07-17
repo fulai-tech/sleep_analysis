@@ -79,7 +79,11 @@ class Model(nn.Module):
             if "weight_ih" in name:  # Input-to-hidden weights
                 nn.init.uniform_(param, a=-0.1, b=0.1)  # Uniform range prevents NaNs
             elif "weight_hh" in name:  # Hidden-to-hidden weights
-                nn.init.orthogonal_(param)  # Helps with stability
+                # orthogonal init uses QR decomp which can fail with some CUDA driver/lib combos.
+                # Do it on CPU, then copy back to the original device.
+                cpu_param = param.data.cpu()
+                nn.init.orthogonal_(cpu_param)
+                param.data.copy_(cpu_param)
             elif "bias" in name:
                 nn.init.constant_(param, 0)  # Biases set to zero
 

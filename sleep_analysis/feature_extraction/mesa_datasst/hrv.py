@@ -15,7 +15,7 @@ from hrvanalysis import (
 
 from sleep_analysis.feature_extraction.mesa_datasst.utils import check_processed
 
-with open(Path(__file__).parents[2].joinpath("study_data.json")) as f:
+with open(Path(__file__).parents[3].joinpath("study_data.json")) as f:
     path_dict = json.load(f)
     mesa_path = Path(path_dict["mesa_path"])
     processed_mesa_path = Path(path_dict["processed_mesa_path"])

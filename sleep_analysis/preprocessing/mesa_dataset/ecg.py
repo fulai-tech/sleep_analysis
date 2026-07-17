@@ -34,7 +34,8 @@ def process_rpoint(ecg_df):
     ecg_df = pd.concat([ecg_df, rr_intervals], axis=1)
 
     # filter RRI
-    t1 = ecg_df.epoch.value_counts().reset_index().rename({"index": "epoch_idx", "epoch": "count"}, axis=1)
+    t1 = ecg_df.epoch.value_counts().reset_index()
+    t1.columns = ["epoch_idx", "count"]
     invalid_idx = set(t1[t1["count"] < 10]["epoch_idx"].values)
     del t1
     ecg_df = ecg_df[~ecg_df["epoch"].isin(list(invalid_idx))]

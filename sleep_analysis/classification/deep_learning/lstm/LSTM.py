@@ -101,6 +101,9 @@ class LSTM:
         modality,
         dataset_name,
         classification_type="binary",
+        output_dir=None,
+        focal_gamma=2.0,
+        grad_clip=0.5,
     ):
         torch.manual_seed(seed=42)
         torch.cuda.manual_seed(seed=42)
@@ -124,6 +127,9 @@ class LSTM:
         self.modality = modality
         self.dataset_name = dataset_name
         self.classification_type = classification_type
+        self.output_dir = Path(output_dir) if output_dir else Path(__file__).parents[4] / "exports_our"
+        self.focal_gamma = focal_gamma
+        self.grad_clip = grad_clip
 
         if self.use_gpu:
             self.device = "cuda"
@@ -146,11 +152,12 @@ class LSTM:
         print(f"len(y_train): {len(y_train.detach().numpy())}")
 
         weight_classes = class_sample_count / len(y_train.detach().numpy())
-        class_weights = torch.tensor(weight_classes).float().to(self.device)
+        class_weights = torch.tensor(weight_classes).float()
+        class_weights_cpu = 1 - class_weights       # 先在 CPU 算好
 
-        class_weights = 1 - class_weights
+        print(f"class_weights: {class_weights_cpu.tolist()}", flush=True)
 
-        print(f"class_weights: {class_weights}")
+        class_weights = class_weights_cpu.to(self.device)   # 最后才搬上 GPU
 
         # load empty model of our lstm class that needs to be trained
         lstm = self._load_empty_model(use_gpu=self.use_gpu, num_classes=num_classes, dropout=self.dropout, use_attention=False)
@@ -167,7 +174,7 @@ class LSTM:
         else:
             print("set focal loss for multi-class classification", flush=True)
             # If N1 & REM still underperform, tune gamma (try values like 1.5, 2.5).
-            criterion = WeightedFocalLoss(class_weights=class_weights, gamma=2.0, reduction="mean")
+            criterion = WeightedFocalLoss(class_weights=class_weights, gamma=self.focal_gamma, reduction="mean")
 
         print("learning rate", self.learning_rate)
         print("batch size", self.batch_size)
@@ -241,7 +248,7 @@ class LSTM:
                         param.grad += noise
 
                 #  Step 3: Apply Even Stronger Gradient Clipping
-                torch.nn.utils.clip_grad_norm_(lstm.parameters(), max_norm=0.5)  # Reduce gradient explosion
+                torch.nn.utils.clip_grad_norm_(lstm.parameters(), max_norm=self.grad_clip)  # Reduce gradient explosion
 
                 #  Step 4: Use SGD with Momentum for the Attention Layer Only
                 attention_params = [param for name, param in lstm.named_parameters() if "attention.attention_weights" in name]
@@ -265,7 +272,9 @@ class LSTM:
                 print("Epoch: %d, train loss: %1.5f" % (epoch, np.mean(train_losses)))
 
                 val_losses = []
-                val_performances = []
+                val_mccs = []
+                val_accs = []
+                val_kappas = []
                 lstm.eval()
 
                 # load validation data in batches
@@ -284,21 +293,21 @@ class LSTM:
                     else:
                         val_loss = criterion(y_pred, torch.squeeze(y_batch_val).long())
 
-                    # append batch-wise loss to corresponding list
                     val_losses.append(val_loss.item())
 
-                    # calculate accuracy of prediction
+                    # calculate metrics
                     class_performance = tensor_to_performance(y_batch_val, y_pred, self.classification_type)
+                    val_mccs.append(class_performance["mcc"])
+                    val_accs.append(class_performance["accuracy"])
+                    val_kappas.append(class_performance["kappa"])
 
-                    # append accuracy of batch-wise prediction to corresponding list
-                    val_performances.append(class_performance["mcc"])
-
-                # calculate mean loss/accuracy over all batches
                 mean_val_loss = np.mean(val_losses)
-                mean_performance = np.mean(val_performances)
+                mean_mcc = np.mean(val_mccs)
+                mean_acc = np.mean(val_accs)
+                mean_kappa = np.mean(val_kappas)
 
                 print(f"Validation Loss: {mean_val_loss:.5f}")
-                print(f"Validation MCC: {mean_performance:.5f}")
+                print(f"Validation Acc: {mean_acc:.4f}  Kappa: {mean_kappa:.4f}  MCC: {mean_mcc:.4f}")
                 print("-------------------------")
 
                 #  Overfitting Check: Stop if training loss is much lower than validation loss
@@ -307,30 +316,36 @@ class LSTM:
                     print("[WARNING] Possible Overfitting Detected: Large gap between train and validation loss.")
                     patience_counter += 1
 
+                #  Save checkpoint every 5 epochs
+                if epoch > 0 and epoch % 5 == 0:
+                    ckpt_dir = self.output_dir / "checkpoints"
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
+                    ckpt_name = (
+                        f"ckpt_epoch_{epoch:03d}_"
+                        f"acc{mean_acc:.4f}_"
+                        f"k{mean_kappa:.4f}_"
+                        f"mcc{mean_mcc:.4f}.pt"
+                    )
+                    torch.save(lstm.state_dict(), ckpt_dir / ckpt_name)
+                    print(f"[CHECKPOINT] Saved {ckpt_name}", flush=True)
+
                 #  Improved Early Stopping
                 if mean_val_loss < min_val_loss:
                     min_val_loss = mean_val_loss
-                    max_val_performance = mean_performance
+                    max_val_performance = mean_mcc
                     patience_counter = 0  # Reset patience if improvement is found
 
                     print("*************************")
                     print(f"New Best Validation Loss: {mean_val_loss:.5f}")
-                    print(f"Validation Performance (MCC): {mean_performance:.5f}")
+                    print(f"Validation Acc: {mean_acc:.4f}  Kappa: {mean_kappa:.4f}  MCC: {mean_mcc:.4f}")
                     print("*************************", flush=True)
 
                     #  Save best model
+                    ckpt_dir = self.output_dir / "checkpoints"
+                    ckpt_dir.mkdir(parents=True, exist_ok=True)
                     torch.save(
                         lstm.state_dict(),
-                        Path(__file__)
-                        .parents[4]
-                        .joinpath(
-                            "exports/pickle_pipelines/lstm_"
-                            + "_".join(self.modality)
-                            + "_"
-                            + self.dataset_name
-                            + "_"
-                            + self.classification_type
-                        ),
+                        ckpt_dir / "best_model.pt",
                     )
 
                 else:
@@ -340,7 +355,7 @@ class LSTM:
                 #  Define new stopping criteria
                 if (
                         patience_counter >= patience_threshold  # Stop if patience runs out
-                        or (epoch > min_epochs and mean_performance <= 0.0)  # Stop if MCC is bad
+                        or (epoch > min_epochs and mean_mcc <= 0.0)  # Stop if MCC is bad
                 ):
                     print("[STOPPING] Training stopped due to no improvement or bad MCC.", flush=True)
                     break
@@ -394,16 +409,9 @@ class LSTM:
             pred_dict[subj_idx] = y_pred
 
             # safe sleep stage predictions with subject id to csv file for subsequent analysis
-            if retrain:
-                pd.DataFrame(y_pred).to_csv(Path(__file__)
-                    .parents[4]
-                    .joinpath(
-                        "exports/results_per_subject/lstm", self.dataset_name, self.classification_type, "retrain").joinpath(str(subj_idx) +  ".csv"))
-            else:
-                pd.DataFrame(y_pred).to_csv(Path(__file__)
-                    .parents[4]
-                    .joinpath(
-                        "exports/results_per_subject/lstm", self.dataset_name, self.classification_type ,"radar_only").joinpath(str(subj_idx) + ".csv"))
+            subj_pred_dir = self.output_dir / "per_subject_predictions"
+            subj_pred_dir.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(y_pred).to_csv(subj_pred_dir / f"{subj_idx}.csv")
 
             # calculate classification performance for each subject
             subj_score = dl_score(
@@ -411,8 +419,10 @@ class LSTM:
             )
             score_dict[subj_idx] = subj_score
 
-        score_mean = pd.DataFrame(score_dict).agg(["mean"], axis=1).T
         subject_results = pd.DataFrame(score_dict)
+        # 排除 no_agg 包裹的对象 (confusion_matrix)，新版 pandas 无法对其求 mean
+        numeric_cols = [c for c in subject_results.index if c != "confusion_matrix"]
+        score_mean = subject_results.loc[numeric_cols].agg(["mean"], axis=1).T
 
         return subject_results, score_mean, pred_dict
 
@@ -420,22 +430,22 @@ class LSTM:
         return list(x_train.split(self.batch_size)), list(y_train.split(self.batch_size))
 
     def _load_best_model(self, model):
+        """加载本次训练过程中的最佳模型权重"""
         model.load_state_dict(
-            torch.load(
-                Path(__file__)
-                .parents[4]
-                .joinpath(
-                    "exports/pickle_pipelines/lstm_"
-                    + "_".join(self.modality)
-                    + "_"
-                    + self.dataset_name
-                    + "_"
-                    + self.classification_type
-                )
-            )
+            torch.load(self.output_dir / "checkpoints" / "best_model.pt")
         )
-
         model.eval()
+
+    def _load_best_model_from_path(self, weights_path):
+        """从指定路径加载权重 (用于恢复训练或评估历史模型)"""
+        self.weights_loaded_from = weights_path
+        # 这个标记会在 test() 中被 _load_best_model 使用
+        # 实际上 test() 调 _load_best_model，需要 hack 一下让它用外部路径
+        # 这里重写 _load_best_model 行为:
+        self._load_best_model = lambda model: (
+            model.load_state_dict(torch.load(weights_path)),
+            model.eval()
+        )
 
     def _load_best_mesa_model(self, model):
         model.load_state_dict(
@@ -443,7 +453,7 @@ class LSTM:
                 Path(__file__)
                 .parents[4]
                 .joinpath(
-                    "exports/pickle_pipelines/lstm_"
+                    "exports_our/pickle_pipelines/lstm_"
                     + "_".join(self.modality)
                     + "_"
                     + "MESA_Sleep"

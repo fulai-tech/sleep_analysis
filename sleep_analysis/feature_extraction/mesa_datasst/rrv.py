@@ -22,7 +22,7 @@ def extract_rrv_features(overwrite=False):
     :param overwrite: If overwrite = True, the features are calculated and overwritten. If set to false, all features that are calculated are skipped.
     """
 
-    with open(Path(__file__).parents[2].joinpath("study_data.json")) as f:
+    with open(Path(__file__).parents[3].joinpath("study_data.json")) as f:
         path_dict = json.load(f)
         edf_path = Path(path_dict["mesa_path"]).joinpath("polysomnography/edfs")
         processed_mesa_path = Path(path_dict["processed_mesa_path"])
