@@ -23,6 +23,7 @@ htmlcov/
 *.swo
 
 # Temp files
+*.log
 results/
 exports_our/
 
