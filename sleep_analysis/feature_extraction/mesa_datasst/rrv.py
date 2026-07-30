@@ -53,6 +53,7 @@ def extract_rrv_features(overwrite=False):
 
 
 def extract_rrv_features_helper(resp_arr, nan_pad=1.0, sampling_rate=32):
+    # 20260729 - rdwang: 注释和代码不一致，作者实际用的是5个epoch、7个epoch、9个epoch，分别对应2.5min、3.5min、4.5min，与当前注释不一致
     """
     Calculate features for sliding widows of 5 min (10 epochs), 7 min (14 epochs) and 9 min (18 epochs) with overlap of 30s (1 epoch)
     according to Fonseca et al., 2015
@@ -66,6 +67,8 @@ def extract_rrv_features_helper(resp_arr, nan_pad=1.0, sampling_rate=32):
     # resp_arr_30s = sliding_window(resp_arr, 30*32, overlap_samples=0)
 
     # mode=mean to prevent first epochs to be zero --> no breathing extracted --> exception
+
+    # 20260730 - rdwang: 作者的数据处理脏代码，非致命bug。目前是首尾各补(窗长-1)/2长度的均值，更好的操作应该是直接先给原始数据padding首尾以及在尾部补足整除不足的部分，而不是现在的补nan，然后再过sliding_window。这样能保证没有nan，且首尾涉及padding的数据中，只有缺失数据段被补成了均值，而不是整个数据都是均值
     resp_arr_150s = np.nan_to_num(
         np.pad(
             sliding_window(resp_arr, 150 * sampling_rate, overlap_samples=120 * sampling_rate),
@@ -172,25 +175,39 @@ def calc_rrv_features(rsp_rate, peaks_dict, sampling_rate: int):
     return rrv.to_dict("records")
 
 
-def process_resp(resp_df, epochs):
+def process_resp(resp_df, epochs, sampling_rate_in=256):
+    """Downsample the respiration signal to 32 Hz and align the epoch / time index to it.
+
+    The epoch and time index are re-mapped by sample position (``j * sampling_rate_in /
+    sampling_rate_out``) rather than sliced with an integer stride. Integer-stride slicing
+    (``[::step]`` with ``step = int(sampling_rate_in / 32)``) only matches the resampled
+    length when ``sampling_rate_in`` is an exact multiple of 32:
+
+        256 Hz -> 32 Hz: factor 8.0     -> stride slicing works (MESA / some SHHS2 files)
+        250 Hz -> 32 Hz: factor 7.8125  -> stride 7 != 7.8125 -> length mismatch
+        125 Hz -> 32 Hz: factor 3.90625 -> stride 3 != 3.90625 -> length mismatch (SHHS1)
+
+    For non-multiple-of-32 rates the truncated stride desynchronises the index from the
+    resampled data, so ``pd.DataFrame(resp_arr, index=time_index)`` raised
+    "Shape of passed values ... indices imply ...". Mapping by sample position guarantees
+    ``len(time_index) == len(epochs) == len(resp_arr)`` for any input sampling rate.
+    """
     time_index = resp_df.index
 
-    sampling_rate_in = 256
     sampling_rate_out = 32
     resp_arr = _downsample_resp(resp_df, sampling_rate_in=sampling_rate_in, sampling_rate_out=sampling_rate_out)
-    epochs = epochs[:: int(sampling_rate_in / sampling_rate_out)]
-    time_index = time_index[:: int(sampling_rate_in / sampling_rate_out)]
+    n_out = len(resp_arr)
+    indices = (np.arange(n_out) * sampling_rate_in / sampling_rate_out).astype(int)
+    indices = np.clip(indices, 0, len(epochs) - 1)
+    epochs = epochs[indices]
+    time_index = time_index[indices]
 
     resp_df = pd.DataFrame(resp_arr, index=time_index)
-
-    # peaks = extract_peaks(resp_arr,32)
-    # _plot_features(resp_arr,peaks,32)
-    # _plot_rsp_rate(resp_arr,peaks,32)
-
     return resp_df, epochs
 
 
 def _downsample_resp(resp_df, sampling_rate_in: int, sampling_rate_out: int):
+    # 20260729 - rdwang: 这里是全部数据直接做的双向滤波，不符合事实睡眠分期的需求，要改整个处理链路
     cleaned = nk.rsp_clean(resp_df, sampling_rate=sampling_rate_in, method="biosppy")
 
     return bp.utils.array_handling.downsample(np.asarray(cleaned), sampling_rate_in, sampling_rate_out)

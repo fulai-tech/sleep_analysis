@@ -28,6 +28,15 @@ def _create_datetime_index(starttime, times_array):
 
 
 def _generate_epochs(datetime_index):
+    # 20260729 - rdwang: 作者对epoch编号的处理存在bug，start_time = 20:29:59和start_time = 20:30:01仅差2s，但epoch编号会错位15s，举例：
+    # 实际时间点20:30:14，start_time = 20:29:59时，epochs_30s被赋值20:30:00，epoch_clear = 1 / 30，epochs = 0
+    # 实际时间点20:30:16，start_time = 20:29:59时，epochs_30s被赋值20:30:30，epoch_clear = 31 / 30，epochs = 1
+    # epochs 1 此时对应的时间范围是 20:30:15-20:30:44
+    # 实际时间点20:30:14，start_time = 20:30:01时，epochs_30s被赋值20:30:00，epoch_clear = -1 / 30，epochs = 0
+    # 实际时间点20:30:16，start_time = 20:30:01时，epochs_30s被赋值20:30:30，epoch_clear = 29 / 30，epochs = 0
+    # 只有当实际时间20:30:45，start_time = 20:30:01时，epochs_30s被赋值20:31:00，epoch_clear = 59 / 30，epochs = 1
+    # epochs 1 此时对应的时间范围是 20:30:45 - 20:31:14
+    # start_time仅仅差2s，但却导致epoch覆盖范围相差 30s 
     start_time = datetime_index[0]
     epochs_30s = datetime_index.round("30s")
 

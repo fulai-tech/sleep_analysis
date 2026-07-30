@@ -49,9 +49,10 @@ class DataPreparation:
     :param overlap: Overlap of Sequences: Highly impacts runtime
     """
 
-    def __init__(self, seq_len, overlap):
+    def __init__(self, seq_len, overlap, causal=False):
         self.seq_len = seq_len
         self.overlap = overlap
+        self.causal = causal   # True=只在左侧padding (实时分期), False=居中padding (原文)
 
     def get_sequence_data(self, features: pd.DataFrame, ground_truth: pd.DataFrame, overlap, padding=False):
         """
@@ -67,7 +68,10 @@ class DataPreparation:
         ground_truth_arr = np.asarray(ground_truth)
 
         if padding:
-            npad = ((int(self.seq_len / 2), int(self.seq_len / 2)), (0, 0))
+            if self.causal:
+                npad = ((self.seq_len - 1, 0), (0, 0))   # 只垫历史，预测最后时刻
+            else:
+                npad = ((int(self.seq_len / 2), int(self.seq_len / 2)), (0, 0))  # 居中，原文方式
             feature_arr = np.pad(feature_arr, npad, mode="mean")
             y_mat = ground_truth_arr
             x_mat = bp.utils.array_handling.sliding_window(
@@ -145,7 +149,7 @@ class DataPreparation:
                         "150_hrv_total_power",
                     ]
                 ]
-                elif dataset.__class__.__name__ == "MesaDataset":
+                elif dataset.__class__.__name__ in ("MesaDataset", "ShhsDataset"):
                     hrv_features = all_features.filter(regex="_hrv")[
                         [
                         "_hrv_median_nni",
@@ -179,7 +183,7 @@ class DataPreparation:
                 features = pd.concat([features, rrv_features], axis=1)
 
             if "EDR" in modality:
-                edr_features = subj.features.filter(regex="EDR")[
+                edr_features = all_features.filter(regex="EDR")[
                     [
                         "150_EDR_MeanBB",
                         "150_EDR_LF",

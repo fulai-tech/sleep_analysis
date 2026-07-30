@@ -9,9 +9,14 @@ SHHS 数据预处理管线 (多进程并行，断点续跑)
     python experiments/data_handling/preprocess_shhs.py --study shhs1 --n-subjects 3   # 试跑
 """
 
+# 必须在 import numpy / mne 之前设置，防止每个子进程内部的多线程争抢
+import os
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+
 import argparse
 import json
-import os
 import re
 import sys
 import time
@@ -44,8 +49,8 @@ def parse_shhs_xml(xml_path):
     return pd.DataFrame({"time": time_list, "sleep": sleep_list})
 
 
-def generate_r_points_from_ecg(raw_ecg_values, sampling_rate=256):
-    """neurokit2 自动 R 峰检测。"""
+def generate_r_points_from_ecg(raw_ecg_values, sampling_rate):
+    """neurokit2 自动 R 峰检测。sampling_rate 由 EDF 动态读取，不做硬编码。"""
     import neurokit2 as nk
     ecg_cleaned = nk.ecg_clean(raw_ecg_values, sampling_rate=sampling_rate)
     _, rpeaks_info = nk.ecg_peaks(ecg_cleaned, sampling_rate=sampling_rate)
@@ -58,14 +63,29 @@ def generate_r_points_from_ecg(raw_ecg_values, sampling_rate=256):
 
 
 def sleep_stage_map(df_psg):
-    """NSRR 分期字符串 → 数字标签 (Wake=0, N1=1, N2=2, N3=3, REM=5)。"""
-    mapping = {"Wake|0": 0, "Stage 1 sleep|1": 1, "Stage 2 sleep|2": 2,
-               "Stage 3 sleep|3": 3, "REM sleep|5": 5}
+    """NSRR 分期字符串 → 数字标签 (Wake=0, N1=1, N2=2, N3=3, REM=4)。
+
+    SHHS 使用 Rechtschaffen & Kales 标准，包含 MESA 没有的额外阶段:
+      - Stage 4 sleep|4 → 映射为 N3 (3), 与 Stage 3 合并
+      - Unscored|9    → NaN, 后续从交集中剔除
+      - Movement|6     → NaN, 同上
+    """
+    mapping = {
+        "Wake|0": 0,
+        "Stage 1 sleep|1": 1,
+        "Stage 2 sleep|2": 2,
+        "Stage 3 sleep|3": 3,
+        "Stage 4 sleep|4": 3,      # R&K Stage 4 = AASM N3
+        "REM sleep|5": 4,           # NSRR REM=5 → AASM REM=4 (与 MESA 对齐)
+        "Unscored|9": np.nan,      # 未评分 — 剔除
+        "Movement|6": np.nan,       # 体动伪迹 — 剔除
+    }
     ss = df_psg[["sleep"]].copy()
     ss["5stage"] = ss["sleep"].map(mapping)
-    ss["4stage"] = ss["5stage"].map({0: 0, 1: 1, 2: 1, 3: 2, 5: 3})
-    ss["3stage"] = ss["5stage"].map({0: 0, 1: 1, 2: 1, 3: 1, 5: 2})
-    ss["sleep"] = ss["5stage"].map({0: 0, 1: 1, 2: 1, 3: 1, 5: 1})
+    ss["4stage"] = ss["5stage"].map({0: 0, 1: 1, 2: 1, 3: 2, 4: 3})  # Wake/N1+N2/N3/REM
+    ss["3stage"] = ss["5stage"].map({0: 0, 1: 1, 2: 1, 3: 1, 4: 2})  # Wake/NREM/REM
+    # binary sleep: 仅 5stage!=0 且非 NaN 的 epoch 为 Sleep=1
+    ss["sleep"] = ss["5stage"].apply(lambda x: 1 if pd.notna(x) and x != 0 else (0 if pd.notna(x) else np.nan))
     return ss
 
 
@@ -92,7 +112,15 @@ def process_rpoint(ecg_df):
 
 
 def extract_edf_channel(edf_dir, subj, channel, study_prefix):
-    """从 SHHS EDF 提取指定通道。"""
+    """从 SHHS EDF 提取指定通道，返回原始数据 + 实际采样率。
+
+    采样率随数据集/文件而变，因此按 EDF 实际 sfreq 动态读取，不在此处重采样，
+    由下游 process_resp 按实际采样率对齐到 32 Hz：
+        SHHS1: ECG ~125 Hz
+        SHHS2: ECG 既有 250 Hz 也有 256 Hz（不同站点/设备），不是固定 256 Hz
+    注意：MNE 读取混合采样率的 EDF 时会把所有通道上采样到文件内最高采样率，
+    因此这里的 native_rate 是文件级公共采样率（如 THOR RES 原生 8-10 Hz 会被提升到 250/256）。
+    """
     import mne
     from sleep_analysis.preprocessing.utils import _create_datetime_index
 
@@ -101,11 +129,13 @@ def extract_edf_channel(edf_dir, subj, channel, study_prefix):
         raise FileNotFoundError(f"EDF not found: {edf_path}")
     edf = mne.io.read_raw_edf(edf_path, verbose=False)
     ch_data = edf.pick_channels([channel])
+    native_rate = float(ch_data.info["sfreq"])
     data = ch_data.get_data()[0, :]
+
     time_idx, epochs = _create_datetime_index(ch_data.info["meas_date"],
                                               times_array=ch_data.times)
     col_name = "ecg" if channel in ("ECG", "EKG") else "resp"
-    return pd.DataFrame(data, index=time_idx).rename(columns={0: col_name}), epochs
+    return pd.DataFrame(data, index=time_idx).rename(columns={0: col_name}), epochs, native_rate
 
 
 # ---------------------------------------------------------------------------
@@ -131,13 +161,15 @@ def process_one_subject(cfg):
     t0 = time.time()
     timings = {}
 
+    out_edr = out_rrv = out_ecg = out_hrv = out_merge = None
     try:
         # --- Step 1: EDR ---
         out_edr = processed_dir / f"edr_respiration_features_raw/edr_respiration{subj}.csv"
         if not out_edr.exists():
-            raw_ecg, epochs = extract_edf_channel(edf_dir, subj, channel_ecg, study)
-            edr_signal = _extract_edr(raw_ecg, sampling_rate=256)
-            resp_df, epochs = process_resp(edr_signal.respiratory_signal, epochs)
+            raw_ecg, epochs, ecg_rate = extract_edf_channel(edf_dir, subj, channel_ecg, study)
+            edr_signal = _extract_edr(raw_ecg, sampling_rate=ecg_rate)
+            resp_df, epochs = process_resp(edr_signal.respiratory_signal, epochs,
+                                           sampling_rate_in=ecg_rate)
             features = extract_rrv_features_helper(resp_df, nan_pad=0.0, sampling_rate=32)
             features.to_csv(out_edr)
         timings["edr"] = time.time() - t0
@@ -146,8 +178,9 @@ def process_one_subject(cfg):
         # --- Step 2: RRV ---
         out_rrv = processed_dir / f"respiration_features_raw/respiration{subj}.csv"
         if not out_rrv.exists():
-            resp_df, epochs = extract_edf_channel(edf_dir, subj, channel_resp, study)
-            resp_df, epochs = process_resp(resp_df, epochs)
+            resp_df, epochs, resp_rate = extract_edf_channel(edf_dir, subj, channel_resp, study)
+            resp_df, epochs = process_resp(resp_df, epochs,
+                                           sampling_rate_in=resp_rate)
             features = extract_rrv_features_helper(resp_df)
             features.to_csv(out_rrv)
         timings["rrv"] = time.time() - t1
@@ -169,8 +202,9 @@ def process_one_subject(cfg):
             if rp_file.exists():
                 df_rp = pd.read_csv(rp_file)
             else:
-                raw_ecg, _ = extract_edf_channel(edf_dir, subj, channel_ecg, study)
-                df_rp = generate_r_points_from_ecg(raw_ecg.iloc[:, 0].values)
+                raw_ecg, _, _ecg_rate = extract_edf_channel(edf_dir, subj, channel_ecg, study)
+                df_rp = generate_r_points_from_ecg(raw_ecg.iloc[:, 0].values,
+                                                    sampling_rate=_ecg_rate)
             df_hr = process_rpoint(df_rp)
 
             # Sleep stages
@@ -178,6 +212,8 @@ def process_one_subject(cfg):
             sleep_st = df_psg[["epoch", "sleep"]].drop_duplicates(subset="epoch")
             labels = sleep_stage_map(sleep_st)
             labels["epoch"] = sleep_st["epoch"].values
+            # 剔除 Unscored (NaN) 和 Movement (NaN) 的 epoch
+            labels = labels.dropna(subset=["5stage"])
 
             # Respiration & EDR features
             df_resp = pd.read_csv(out_rrv, index_col=0)
@@ -201,7 +237,7 @@ def process_one_subject(cfg):
             labels = labels[labels["epoch"].isin(intersect)].copy()
 
             # Sleep duration filter
-            sleep_n = (labels["sleep"] != "Wake|0").sum()
+            sleep_n = labels["sleep"].sum()  # sleep 列被 sleep_stage_map 转为 0=Wake 1=Sleep
             if sleep_n <= 120:
                 return (subj, False, {"reason": f"sleep {sleep_n} ≤ 120"})
 
@@ -348,20 +384,45 @@ def main():
     # --- 多进程并行处理 ---
     import multiprocessing as mp
     from concurrent.futures import ProcessPoolExecutor, as_completed
+    import signal as _signal
 
     t_start = time.time()
     success = 0
     fail = 0
     total_elapsed = 0.0
+    executor = None
 
-    # 每 30s 打印一次进度概要
+    def _cleanup_executor():
+        """确保主进程退出时所有 worker 被强制终止，不留孤儿进程。"""
+        nonlocal executor
+        if executor is not None:
+            for pid in list(executor._processes.keys()):
+                try:
+                    p = executor._processes[pid]
+                    p.kill()
+                    p.join(timeout=2)
+                except Exception:
+                    pass
+            executor.shutdown(wait=False, cancel_futures=True)
+
+    def _handle_signal(signum, frame):
+        print(f"\n[INTERRUPTED] Signal {signum} received, cleaning up workers...", flush=True)
+        _cleanup_executor()
+        print("[INTERRUPTED] Workers terminated. Re-run to resume from checkpoint.", flush=True)
+        sys.exit(1)
+
+    _signal.signal(_signal.SIGINT, _handle_signal)
+    _signal.signal(_signal.SIGTERM, _handle_signal)
+
     last_report = time.time()
 
     def save_cp(data):
         with open(cp_file, "w") as f:
             json.dump(sorted(data), f)
 
-    with ProcessPoolExecutor(max_workers=N_WORKERS, mp_context=mp.get_context("spawn")) as executor:
+    try:
+        executor = ProcessPoolExecutor(max_workers=N_WORKERS,
+                                        mp_context=mp.get_context("spawn"))
         futures = {}
         for subj in pending:
             task_cfg = {**base_cfg, "subj": subj}
@@ -402,6 +463,8 @@ def main():
                 print(f"  ── Progress: {done}/{len(pending)} ({done/len(pending)*100:.1f}%) "
                       f"| avg={avg:.0f}s/subj | elapsed={elapsed_s/3600:.1f}h | ETA={eta_str}")
                 last_report = now
+    finally:
+        _cleanup_executor()
 
     # --- 最终统计 ---
     elapsed_total = time.time() - t_start

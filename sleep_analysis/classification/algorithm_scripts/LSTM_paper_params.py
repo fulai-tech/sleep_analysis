@@ -2,23 +2,25 @@
 LSTM 训练脚本 —— 使用论文 Krauss et al. (2025) 中的最优参数
 ============================================================
 论文: Incorporating Respiratory Signals for ML-based Multi-Modal Sleep Stage Classification
-参数来源: 5-Class Classification - MESA Baseline
+参数来源: 5-Class / 3-Class Classification - MESA / SHHS Baseline
 
 每次训练自动在 exports_our/<时间戳>/ 下保存 config.json，里面记录了所有参数。
 不需要改脚本，通过命令行参数切换配置。
 
 用法:
-    # 论文默认参数 (5分类, ACT+HRV+RRV, 170 epoch)
-    PATH="..." PYTHON_KEYRING_BACKEND=... python LSTM_paper_params.py
+    # MESA 5 分类 (论文默认, ACT+HRV+RRV, 170 epoch)
+    python LSTM_paper_params.py -d MESA_Sleep -c 5stage
+
+    # SHHS1 / SHHS2 (无体动数据，自动使用 HRV+RRV)
+    python LSTM_paper_params.py -d SHHS1 -c 5stage
+    python LSTM_paper_params.py -d SHHS2 -c 3stage
 
     # 快速测试 (20人, 3 epoch)
-    python LSTM_paper_params.py --small --quick
+    python LSTM_paper_params.py -d SHHS1 --small --quick
 
-    # 3分类 + 不同超参数
+    # 切换模态或超参数
     python LSTM_paper_params.py -c 3stage --hidden 256 --layers 4 --lr 1e-4
-
-    # 只用 HRV 特征
-    python LSTM_paper_params.py --modality HRV
+    python LSTM_paper_params.py -d MESA_Sleep --modality HRV RRV
 
     # 查看所有参数
     python LSTM_paper_params.py --help
@@ -39,17 +41,22 @@ from sleep_analysis.classification.deep_learning.lstm.LSTM import LSTM
 from sleep_analysis.classification.deep_learning.utils import get_num_input
 from sleep_analysis.datasets.helper import get_random_split
 from sleep_analysis.datasets.mesadataset import MesaDataset
+from sleep_analysis.datasets.shhs_dataset import ShhsDataset
 
 # ---------------------------------------------------------------------------
 # 命令行参数
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="LSTM Sleep Stage Classification")
 # 数据集
+parser.add_argument("-d", "--dataset", default="MESA_Sleep",
+                    choices=["MESA_Sleep", "SHHS1", "SHHS2"])
 parser.add_argument("--small", action="store_true", help="只用 20 个被试验证管线")
 # 分类
-parser.add_argument("-c", "--classification", default="5stage", choices=["binary", "3stage", "4stage", "5stage"])
-parser.add_argument("-m", "--modality", nargs="+", default=["ACT", "HRV", "RRV"],
-                    choices=["ACT", "HRV", "RRV", "EDR"])
+parser.add_argument("-c", "--classification", default="5stage",
+                    choices=["binary", "3stage", "4stage", "5stage"])
+parser.add_argument("-m", "--modality", nargs="+", default=None,
+                    choices=["ACT", "HRV", "RRV", "EDR"],
+                    help="特征模态 (默认: MESA=ACT+HRV+RRV, SHHS=HRV+RRV)")
 # 训练
 parser.add_argument("--quick", action="store_true", help="快速测试: 只跑 3 个 epoch")
 parser.add_argument("--epochs", type=int, default=170)
@@ -71,6 +78,8 @@ parser.add_argument("--load-weights", type=str, default=None,
                         " 会自动读取同级目录下的 config.json 恢复超参数")
 parser.add_argument("--eval-only", action="store_true",
                     help="仅评估，跳过训练")
+parser.add_argument("--causal", action="store_true",
+                    help="实时分期模式: 仅在序列左侧padding, 预测每个窗口的最后时刻")
 
 args = parser.parse_args()
 
@@ -83,6 +92,7 @@ if args.load_weights:
             saved_config = json.load(f)
         print(f"[LOAD] Restoring params from {config_file}")
         # 用 config.json 里的值覆盖命令行参数
+        args.dataset = saved_config.get("dataset", args.dataset)
         args.classification = saved_config.get("classification", args.classification)
         args.modality = saved_config.get("modality", args.modality)
         args.hidden_size = saved_config.get("hidden_size", args.hidden_size)
@@ -93,6 +103,7 @@ if args.load_weights:
         args.batch_size = saved_config.get("batch_size", args.batch_size)
         args.focal_gamma = saved_config.get("focal_gamma", args.focal_gamma)
         args.grad_clip = saved_config.get("grad_clip", args.grad_clip)
+        args.causal = saved_config.get("causal", args.causal)
         args.seed = saved_config.get("seed", args.seed)
     else:
         print(f"[WARNING] {config_file} not found, using current CLI params."
@@ -103,6 +114,19 @@ if args.quick:
     args.epochs = 3
 if args.small:
     print("[SMALL mode] Using only 20 subjects")
+
+# 按数据集自动选择默认 modality
+if args.modality is None:
+    if args.dataset.startswith("SHHS"):
+        args.modality = ["HRV", "RRV"]    # SHHS 无体动数据
+    else:
+        args.modality = ["ACT", "HRV", "RRV"]    # MESA 默认
+
+# 验证 modality 兼容性：SHHS 不能选 ACT
+if "ACT" in args.modality and args.dataset.startswith("SHHS"):
+    print("[WARNING] SHHS has no actigraphy data. "
+          "Removing ACT from modality.")
+    args.modality = [m for m in args.modality if m != "ACT"]
 
 # ---------------------------------------------------------------------------
 # 输出目录 & 配置保存
@@ -115,6 +139,7 @@ OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 # 将所有配置保存为 JSON，以后随时查阅
 config = {
     "timestamp": RUN_TIMESTAMP,
+    "dataset": args.dataset,
     "classification": args.classification,
     "modality": args.modality,
     "small": args.small,
@@ -128,6 +153,7 @@ config = {
     "batch_size": args.batch_size,
     "focal_gamma": args.focal_gamma,
     "grad_clip": args.grad_clip,
+    "causal": args.causal,
     "seed": args.seed,
     "load_weights": args.load_weights,
 }
@@ -157,7 +183,12 @@ print(f"Epochs: {args.epochs}")
 print("=" * 60)
 
 print("\n[1/5] Loading dataset...")
-dataset = MesaDataset() if not args.small else MesaDataset()[0:20]
+if args.dataset == "MESA_Sleep":
+    dataset = MesaDataset() if not args.small else MesaDataset()[0:20]
+elif args.dataset == "SHHS1":
+    dataset = ShhsDataset(study="shhs1") if not args.small else ShhsDataset(study="shhs1")[0:20]
+elif args.dataset == "SHHS2":
+    dataset = ShhsDataset(study="shhs2") if not args.small else ShhsDataset(study="shhs2")[0:20]
 
 train_set, test_set = get_random_split(dataset=dataset)
 train_set, val_set = get_random_split(dataset=train_set)
@@ -167,7 +198,7 @@ print(f"  Subjects: {len(dataset)} total → train {len(train_set)}, val {len(va
 # 2. 构建序列数据
 # ---------------------------------------------------------------------------
 print("\n[2/5] Preparing sequence data...")
-data_loader = DataPreparation(seq_len=args.seq_len, overlap=None)
+data_loader = DataPreparation(seq_len=args.seq_len, overlap=None, causal=args.causal)
 x_train, y_train, x_val, y_val, x_test, y_test = data_loader.get_final_tensors(
     args.modality, train_set, val_set, test_set, args.classification
 )
@@ -193,7 +224,7 @@ model = LSTM(
     dropout=args.dropout,
     batch_size=args.batch_size,
     modality=args.modality,
-    dataset_name="MESA_Sleep",
+    dataset_name=args.dataset,
     classification_type=args.classification,
     output_dir=str(OUTPUT_DIR),
     focal_gamma=args.focal_gamma,

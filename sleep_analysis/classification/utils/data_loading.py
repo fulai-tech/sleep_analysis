@@ -1,5 +1,6 @@
 from sleep_analysis.datasets.d04_main_dataset_control import D04MainStudy
 from sleep_analysis.datasets.mesadataset import MesaDataset
+from sleep_analysis.datasets.shhs_dataset import ShhsDataset
 from sleep_analysis.datasets.helper import get_random_split
 
 
@@ -25,7 +26,20 @@ def load_train_test_set(dataset_name, small=False):
             dataset = D04MainStudy(exclusion_criteria=["EEG"])[0:10]
         else:
             dataset = D04MainStudy()
+        train, test = get_random_split(dataset)
 
+    if dataset_name == "SHHS1":
+        if small:
+            dataset = ShhsDataset(study="shhs1")[0:25]
+        else:
+            dataset = ShhsDataset(study="shhs1")
+        train, test = get_random_split(dataset)
+
+    if dataset_name == "SHHS2":
+        if small:
+            dataset = ShhsDataset(study="shhs2")[0:25]
+        else:
+            dataset = ShhsDataset(study="shhs2")
         train, test = get_random_split(dataset)
 
     return train, test

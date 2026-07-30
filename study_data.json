@@ -1,4 +1,8 @@
 {
+  "shhs1_processed_path": "/srv/shared/psgdata/shhs1_processed",
+  "shhs2_processed_path": "/srv/shared/psgdata/shhs2_processed",
+  "shhs1_path": "/mnt/nas_data/psgdata/SHHS",
+  "shhs2_path": "/mnt/nas_data/psgdata/SHHS",
   "empkins_prestudy": "/Users/danielkrauss/code/Empkins/Data/empkins_bed_pre_study_dataset",
   "processed_mesa_path": "/srv/shared/psgdata/mesa_processed",
   "processed_mesa_path_local": "/srv/shared/psgdata/mesa_processed",

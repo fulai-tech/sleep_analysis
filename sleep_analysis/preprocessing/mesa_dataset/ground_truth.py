@@ -8,7 +8,7 @@ def sleep_stage_convert_binary(df_psg):
     psg = np.asarray(psg)
     psg[psg == "Wake|0"] = 0  # wake = 0
     psg[psg == "Unscored|9"] = np.nan  # drop unscored epochs later
-
+    # 20260729 - rdwang: 这里nan又被赋值为1，逻辑bug，看情况是否要修
     psg[psg != 0] = 1  # sleep = 1
     df_psg = pd.DataFrame(
         psg, columns=["sleep"]

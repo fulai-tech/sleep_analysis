@@ -55,6 +55,16 @@ python experiments/data_handling/preprocess_subset.py 2056   # 全量，约 15-2
 sleep_analysis/classification/algorithm_scripts/LSTM_paper_params.py
 ```
 
+### 数据集选择
+
+| 参数 | 数据集 | 体动 | 可用模态 | 预处理脚本 |
+|---|---|---|---|---|
+| `-d MESA_Sleep` | MESA | 有 | ACT+HRV+RRV(+EDR) | `preprocess_subset.py` |
+| `-d SHHS1` | SHHS1 | 无 | HRV+RRV+EDR | `preprocess_shhs.py --study shhs1` |
+| `-d SHHS2` | SHHS2 | 无 | HRV+RRV+EDR | `preprocess_shhs.py --study shhs2` |
+
+不指定 `-d` 时默认为 `MESA_Sleep`。SHHS 数据集不指定 `--modality` 时自动使用 `HRV RRV EDR`。如果误传 `--modality ACT` 到 SHHS，脚本会打印警告并自动移除。
+
 所有参数通过命令行传入，**不需要修改脚本**。查看完整参数列表：
 
 ```bash
