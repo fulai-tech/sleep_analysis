@@ -166,8 +166,7 @@ def tensor_to_performance(y_true, y_pred, classification_type="binary"):
     y_batch_val = pd.DataFrame(y_batch_val.detach().numpy(), columns=["sleep_stage"])
 
     if classification_type == "binary":
-        y_pred[y_pred >= 0.5] = 1
-        y_pred[y_pred < 0.5] = 0
+        y_pred = (1 / (1 + np.exp(-y_pred)) >= 0.5).astype(float)
     else:
         y_pred = np.argmax(y_pred, axis=1)
 

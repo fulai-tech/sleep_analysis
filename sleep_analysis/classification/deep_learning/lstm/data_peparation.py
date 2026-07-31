@@ -67,6 +67,7 @@ class DataPreparation:
         feature_arr = np.asarray(features)
         ground_truth_arr = np.asarray(ground_truth)
 
+        # 20260731 - rdwang: 确定padding有数据泄漏，无法用于实时分期，具体待查
         if padding:
             if self.causal:
                 npad = ((self.seq_len - 1, 0), (0, 0))   # 只垫历史，预测最后时刻
@@ -121,75 +122,48 @@ class DataPreparation:
         :scaler: Scaler to scale the respective data
         :overlap: overlap that is used in the sliding window method
         """
-        x_dict = {}
-        y_dict = {}
-
-        for subj in dataset:
+        # ---- 特征提取辅助函数 ----
+        def _extract_subj_features(subj):
             features = pd.DataFrame()
             all_features = subj.feature_table
 
             if "ACT" in modality:
                 movement_features = all_features.filter(regex="_acc")[
-                    [
-                        "_acc_mean_1",
-                    ]
+                    ["_acc_mean_1"]
                 ]
                 features = pd.concat([features, movement_features], axis=1)
             if "HRV" in modality:
                 if dataset.__class__.__name__ == "D04MainStudy":
                     hrv_features = all_features.filter(regex="_hrv")[
-                     [
-                        "30_hrv_median_nni",
-                        "30_hrv_ratio_sd2_sd1",
-                        "150_hrv_median_nni",
-                        "150_hrv_vlf",
-                        "150_hrv_lf",
-                        "150_hrv_hf",
-                        "150_hrv_lf_hf_ratio",
-                        "150_hrv_total_power",
+                        [
+                            "30_hrv_median_nni", "30_hrv_ratio_sd2_sd1",
+                            "150_hrv_median_nni", "150_hrv_vlf",
+                            "150_hrv_lf", "150_hrv_hf",
+                            "150_hrv_lf_hf_ratio", "150_hrv_total_power",
+                        ]
                     ]
-                ]
-                elif dataset.__class__.__name__ in ("MesaDataset", "ShhsDataset"):
+                elif dataset.__class__.__name__ in ("MesaDataset", "ShhsDataset", "MixedDataset"):
                     hrv_features = all_features.filter(regex="_hrv")[
                         [
-                        "_hrv_median_nni",
-                        "_hrv_ratio_sd2_sd1",
-                        "_hrv_median_nni",
-                        "_hrv_vlf",
-                        "_hrv_lf",
-                        "_hrv_hf",
-                        "_hrv_lf_hf_ratio",
-                        "_hrv_total_power",
+                            "_hrv_median_nni", "_hrv_ratio_sd2_sd1",
+                            "_hrv_median_nni",
+                            "_hrv_vlf", "_hrv_lf", "_hrv_hf",
+                            "_hrv_lf_hf_ratio", "_hrv_total_power",
+                        ]
                     ]
-                ]
                 else:
                     raise AttributeError("Dataset not known")
-
                 features = pd.concat([features, hrv_features], axis=1)
             if "RRV" in modality:
                 rrv_features = all_features.filter(regex="RRV")[
-                    [
-                        "150_RRV_MedianBB",
-                        "150_RRV_LF",
-                        "270_RRV_MCVBB",
-                        "150_RRV_CVBB",
-                    ]
+                    ["150_RRV_MedianBB", "150_RRV_LF",
+                     "270_RRV_MCVBB", "150_RRV_CVBB"]
                 ]
-                # "150_RRV_MedianBB",
-                # "150_RRV_RMSSD",
-                # "150_RRV_SampEn",
-                # "150_RRV_LFHF",
-
                 features = pd.concat([features, rrv_features], axis=1)
-
             if "EDR" in modality:
                 edr_features = all_features.filter(regex="EDR")[
-                    [
-                        "150_EDR_MeanBB",
-                        "150_EDR_LF",
-                        "150_EDR_HF",
-                        "150_EDR_LFHF",
-                    ]
+                    ["150_EDR_MeanBB", "150_EDR_LF",
+                     "150_EDR_HF", "150_EDR_LFHF"]
                 ]
                 features = pd.concat([features, edr_features], axis=1)
 
@@ -199,19 +173,38 @@ class DataPreparation:
                 ground_truth = subj.ground_truth
                 ground_truth = ground_truth[classification_type]
 
-            x_mat, y_mat = self.get_sequence_data(features, ground_truth, overlap=overlap, padding=padding)
+            return self.get_sequence_data(features, ground_truth,
+                                          overlap=overlap, padding=padding)
 
-            x_dict[subj.index["subj_id"][0]] = x_mat
-            y_dict[subj.index["subj_id"][0]] = y_mat
+        # ---- Pass 1: 统计总量 + fit scaler (不存全量数据) ----
+        total_samples = 0
+        if scaler is None:
+            scaler = StandardScaler()
+            for subj in dataset:
+                x_mat, _ = _extract_subj_features(subj)
+                total_samples += x_mat.shape[0]
+                for chunk in batchify(x_mat):
+                    scaler.partial_fit(chunk.reshape(-1, chunk.shape[-1]))
+        else:
+            for subj in dataset:
+                x_mat, _ = _extract_subj_features(subj)
+                total_samples += x_mat.shape[0]
 
-        x_mat = np.concatenate([x_dict[x] for x in x_dict])
-        y_mat = np.concatenate([y_dict[y] for y in y_dict])
+        # ---- Pass 2: 逐被试 scale → 直接填入预分配 tensor (不 concat) ----
+        n_features = len(scaler.mean_)
+        x_tensor = torch.empty(total_samples, self.seq_len, n_features, dtype=torch.float32)
+        y_tensor = torch.empty(total_samples, 1, dtype=torch.float32)
 
-        x_normalized, scaler = self.scale_data(x_mat, scaler)
+        cursor = 0
+        for subj in dataset:
+            x_mat, y_mat = _extract_subj_features(subj)
+            x_scaled = scaler.transform(x_mat.reshape(-1, n_features)).reshape(x_mat.shape)
+            n = x_scaled.shape[0]
+            x_tensor[cursor:cursor + n] = torch.from_numpy(x_scaled.astype(np.float32))
+            y_tensor[cursor:cursor + n, 0] = torch.from_numpy(y_mat.astype(np.float32))
+            cursor += n
 
-        x_tensor_final, y_tensor = create_tensor(x_normalized, y_mat)
-
-        return x_tensor_final, y_tensor, scaler
+        return x_tensor, y_tensor, scaler
 
     def get_final_tensors(self, modality, train: Dataset, val: Dataset, test: Dataset, classification_type="binary"):
         """
@@ -255,4 +248,4 @@ class DataPreparation:
                 padding=True,
             )
             x_test, y_test = test_to_list(subj, x_test, y_test, x_test_subj, y_test_subj)
-        return x_train, y_train, x_val, y_val, x_test, y_test
+        return x_train, y_train, x_val, y_val, x_test, y_test, scaler

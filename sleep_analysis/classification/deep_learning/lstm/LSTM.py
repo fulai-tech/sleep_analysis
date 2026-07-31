@@ -104,6 +104,7 @@ class LSTM:
         output_dir=None,
         focal_gamma=2.0,
         grad_clip=0.5,
+        val_sources=None,
     ):
         torch.manual_seed(seed=42)
         torch.cuda.manual_seed(seed=42)
@@ -130,6 +131,7 @@ class LSTM:
         self.output_dir = Path(output_dir) if output_dir else Path(__file__).parents[4] / "exports_our"
         self.focal_gamma = focal_gamma
         self.grad_clip = grad_clip
+        self.val_sources = val_sources
 
         if self.use_gpu:
             self.device = "cuda"
@@ -285,7 +287,8 @@ class LSTM:
                     x_batch_val = x_batch_val.to(self.device)
                     y_batch_val = y_batch_val.to(self.device)
 
-                    y_pred = lstm.forward(x_batch_val)
+                    with torch.no_grad():
+                        y_pred = lstm.forward(x_batch_val)
 
                     # calculate loss of batch-wise prediction
                     if self.classification_type == "binary":
@@ -308,13 +311,32 @@ class LSTM:
 
                 print(f"Validation Loss: {mean_val_loss:.5f}")
                 print(f"Validation Acc: {mean_acc:.4f}  Kappa: {mean_kappa:.4f}  MCC: {mean_mcc:.4f}")
+
+                # 混合数据集：按子集计算验证指标
+                if self.val_sources and len(self.val_sources) > 1:
+                    lstm.eval()
+                    print("  Per-source Val:")
+                    import warnings
+                    for src_name, (xs, ys) in sorted(self.val_sources.items()):
+                        src_mccs, src_accs, src_kappas = [], [], []
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore")
+                            for xb, yb in zip(*self.batch_loader(xs, ys)):
+                                xb, yb = xb.to(self.device), yb.to(self.device)
+                                with torch.no_grad():
+                                    yp = lstm.forward(xb)
+                                    perf = tensor_to_performance(yb, yp, self.classification_type)
+                                src_accs.append(perf['accuracy'])
+                                src_kappas.append(perf['kappa'])
+                                src_mccs.append(perf['mcc'])
+                        print(f"    {src_name:12s}  Acc={np.mean(src_accs):.4f}  "
+                              f"Kappa={np.mean(src_kappas):.4f}  MCC={np.mean(src_mccs):.4f}")
                 print("-------------------------")
 
                 #  Overfitting Check: Stop if training loss is much lower than validation loss
                 train_loss = np.mean(train_losses)
                 if (train_loss - mean_val_loss) > 0.3:
                     print("[WARNING] Possible Overfitting Detected: Large gap between train and validation loss.")
-                    patience_counter += 1
 
                 #  Save checkpoint every 5 epochs
                 if epoch > 0 and epoch % 5 == 0:
@@ -391,7 +413,8 @@ class LSTM:
             x_batch_test = x_batch_test[0].to(device=self.device)
 
             # apply model to test data and move to cpu and convert to numpy array
-            y_pred = lstm.forward(x_batch_test).to(device="cpu")
+            with torch.no_grad():
+                y_pred = lstm.forward(x_batch_test).to(device="cpu")
             y_pred = y_pred.detach().numpy()
 
             # move ground truth data to cpu and convert to numpy array
@@ -400,8 +423,7 @@ class LSTM:
 
             # determine prediction based on classification type
             if self.classification_type == "binary":
-                y_pred[y_pred >= 0.5] = 1
-                y_pred[y_pred < 0.5] = 0
+                y_pred = (1 / (1 + np.exp(-y_pred)) >= 0.5).astype(float)
             else:
                 y_pred = np.argmax(y_pred, axis=1)
 

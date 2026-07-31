@@ -106,6 +106,7 @@ class Model(nn.Module):
         if len(x.shape) == 2:
             x = x.reshape(x.shape[0], x.shape[1], 1)
 
+        # 20260731 - rdwang: forward的时候需要单人整夜数据的mean/std，不符合事实分期的要求，适配实时睡眠分期时要修
         mean_x = x.mean(dim=(0, 1), keepdim=True)
         std_x = x.std(dim=(0, 1), keepdim=True) + 1e-8  # Avoid division by zero
 
@@ -124,9 +125,10 @@ class Model(nn.Module):
             h_0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=device)
             c_0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=device)
 
-        # Add small noise to hidden states to prevent instability
-        h_0 += torch.randn_like(h_0) * 1e-3
-        c_0 += torch.randn_like(c_0) * 1e-3
+        # Add small noise to hidden states to prevent instability (training only)
+        if self.training:
+            h_0 += torch.randn_like(h_0) * 1e-3
+            c_0 += torch.randn_like(c_0) * 1e-3
 
         lstm_out, _ = self.lstm(x, (h_0, c_0))  # LSTM output
 

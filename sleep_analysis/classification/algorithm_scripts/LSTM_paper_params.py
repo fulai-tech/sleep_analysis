@@ -42,6 +42,7 @@ from sleep_analysis.classification.deep_learning.utils import get_num_input
 from sleep_analysis.datasets.helper import get_random_split
 from sleep_analysis.datasets.mesadataset import MesaDataset
 from sleep_analysis.datasets.shhs_dataset import ShhsDataset
+from sleep_analysis.datasets.mixed_dataset import MixedDataset
 
 # ---------------------------------------------------------------------------
 # 命令行参数
@@ -49,7 +50,7 @@ from sleep_analysis.datasets.shhs_dataset import ShhsDataset
 parser = argparse.ArgumentParser(description="LSTM Sleep Stage Classification")
 # 数据集
 parser.add_argument("-d", "--dataset", default="MESA_Sleep",
-                    choices=["MESA_Sleep", "SHHS1", "SHHS2"])
+                    help="数据集: MESA_Sleep / SHHS1 / SHHS2 / MESA_Sleep+SHHS2 等任意 '+' 组合")
 parser.add_argument("--small", action="store_true", help="只用 20 个被试验证管线")
 # 分类
 parser.add_argument("-c", "--classification", default="5stage",
@@ -115,18 +116,116 @@ if args.quick:
 if args.small:
     print("[SMALL mode] Using only 20 subjects")
 
-# 按数据集自动选择默认 modality
-if args.modality is None:
-    if args.dataset.startswith("SHHS"):
-        args.modality = ["HRV", "RRV"]    # SHHS 无体动数据
-    else:
-        args.modality = ["ACT", "HRV", "RRV"]    # MESA 默认
+# 数据集创建
+# ---------------------------------------------------------------------------
+DATASET_PARTS = args.dataset.split("+")
+_DS_REGISTRY = {
+    "MESA_Sleep": lambda: MesaDataset(),
+    "SHHS1": lambda: ShhsDataset(study="shhs1"),
+    "SHHS2": lambda: ShhsDataset(study="shhs2"),
+}
 
-# 验证 modality 兼容性：SHHS 不能选 ACT
-if "ACT" in args.modality and args.dataset.startswith("SHHS"):
-    print("[WARNING] SHHS has no actigraphy data. "
-          "Removing ACT from modality.")
-    args.modality = [m for m in args.modality if m != "ACT"]
+# 按数据集默认选 modality
+has_mesa = any(not p.startswith("SHHS") for p in DATASET_PARTS)
+has_shhs = any(p.startswith("SHHS") for p in DATASET_PARTS)
+if args.modality is not None:
+    if has_shhs and "ACT" in args.modality:
+        print("[WARNING] Some datasets have no actigraphy. Removing ACT from modality.")
+        args.modality = [m for m in args.modality if m != "ACT"]
+else:
+    if has_mesa and has_shhs:
+        args.modality = ["HRV", "RRV"]
+    elif has_shhs:
+        args.modality = ["HRV", "RRV"]
+    else:
+        args.modality = ["ACT", "HRV", "RRV"]
+
+# 对每个子数据集分别 80/20 划分，再拼成 train/val/test
+# SHHS1/SHHS2 共享参与者：先按 nsrrid 联合划分，避免同一人被分到训练集和测试集
+_singleton = len(DATASET_PARTS) == 1
+_train_sources, _val_sources, _test_sources = {}, {}, {}
+_shhs_datasets = [p for p in DATASET_PARTS if p.startswith("SHHS")]
+if len(_shhs_datasets) > 1:
+    # 收集所有 SHHS 子集的 nsrrid (SHHS 的 subj_id 就是 nsrrid)
+    _shhs_pids = set()
+    _shhs_ds_map = {}
+    for name in _shhs_datasets:
+        ds = _DS_REGISTRY[name]()
+        if args.small:
+            ds = ds[0:20]
+        key = name.lower().replace("_", "")
+        _shhs_ds_map[key] = ds
+        _shhs_pids.update(ds.index["subj_id"].tolist())
+
+    # 按参与者 ID 划分 (80/20 → 80/20)
+    _pids_sorted = sorted(_shhs_pids)
+    np.random.seed(args.seed)
+    np.random.shuffle(_pids_sorted)
+    n_test = max(1, int(len(_pids_sorted) * 0.2))
+    _test_pids = set(_pids_sorted[:n_test])
+    _trainval_list = _pids_sorted[n_test:]   # 保持列表顺序，避免 set 迭代不确定性
+    n_val = max(1, int(len(_trainval_list) * 0.2))
+    _val_pids_set = set(_trainval_list[:n_val])
+    _train_pids = set(_trainval_list[n_val:])
+
+    print(f"[MIXED] SHHS participant-level split: "
+          f"train={len(_train_pids)}, val={len(_val_pids_set)}, test={len(_test_pids)}")
+    # 防御：确保 train/val/test 无被试重叠
+    assert _train_pids.isdisjoint(_val_pids_set), "SHHS train/val overlap detected!"
+    assert _train_pids.isdisjoint(_test_pids), "SHHS train/test overlap detected!"
+    assert _val_pids_set.isdisjoint(_test_pids), "SHHS val/test overlap detected!"
+
+    for key, ds in _shhs_ds_map.items():
+        train_idx = [i for i, sid in enumerate(ds.index["subj_id"]) if sid in _train_pids]
+        val_idx = [i for i, sid in enumerate(ds.index["subj_id"]) if sid in _val_pids_set]
+        test_idx = [i for i, sid in enumerate(ds.index["subj_id"]) if sid in _test_pids]
+        _train_sources[key] = ds[train_idx] if train_idx else ds[0:0]
+        _val_sources[key] = ds[val_idx] if val_idx else ds[0:0]
+        _test_sources[key] = ds[test_idx] if test_idx else ds[0:0]
+
+# 非 SHHS (MESA) 独立划分
+for name in [p for p in DATASET_PARTS if p not in _shhs_datasets or len(_shhs_datasets) <= 1]:
+    if name not in _DS_REGISTRY:
+        raise ValueError(f"Unknown dataset: {name}")
+    ds = _DS_REGISTRY[name]()
+    if args.small:
+        ds = ds[0:20]
+    if _singleton:
+        dataset = ds
+    else:
+        key = name.lower().replace("_", "")
+        if name.startswith("SHHS"):
+            # 单 SHHS 数据集 (len(_shhs_datasets)<=1)：用标准随机划分
+            src_train, src_test = get_random_split(ds)
+            src_train, src_val = get_random_split(src_train)
+        else:
+            src_train, src_test = get_random_split(ds)
+            src_train, src_val = get_random_split(src_train)
+        _train_sources[key] = src_train
+        _val_sources[key] = src_val
+        _test_sources[key] = src_test
+
+if not _singleton:
+    train_set = MixedDataset(_train_sources)
+    val_set = MixedDataset(_val_sources)
+    test_set = MixedDataset(_test_sources)
+    print(f"[MIXED] {', '.join(DATASET_PARTS)}: "
+          f"train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
+
+    # 最终检查：SHHS1+SHHS2 的 train/val/test 在被试级无重叠
+    if len(_shhs_datasets) > 1:
+        def _de_prefix(ids):
+            """从 shhs1@201206 → 201206 提取原始 nsrrid"""
+            return {str(s).split("@", 1)[-1] for s in ids}
+        train_ids = _de_prefix(train_set.index["subj_id"])
+        val_ids = _de_prefix(val_set.index["subj_id"])
+        test_ids = _de_prefix(test_set.index["subj_id"])
+        assert train_ids.isdisjoint(val_ids), \
+            f"SHHS train/val overlap in final split! {len(train_ids & val_ids)} subjects"
+        assert train_ids.isdisjoint(test_ids), \
+            f"SHHS train/test overlap in final split! {len(train_ids & test_ids)} subjects"
+        assert val_ids.isdisjoint(test_ids), \
+            f"SHHS val/test overlap in final split! {len(val_ids & test_ids)} subjects"
 
 # ---------------------------------------------------------------------------
 # 输出目录 & 配置保存
@@ -182,29 +281,46 @@ print(f"Hyperparams: seq_len={args.seq_len}, hidden={args.hidden_size}, "
 print(f"Epochs: {args.epochs}")
 print("=" * 60)
 
-print("\n[1/5] Loading dataset...")
-if args.dataset == "MESA_Sleep":
-    dataset = MesaDataset() if not args.small else MesaDataset()[0:20]
-elif args.dataset == "SHHS1":
-    dataset = ShhsDataset(study="shhs1") if not args.small else ShhsDataset(study="shhs1")[0:20]
-elif args.dataset == "SHHS2":
-    dataset = ShhsDataset(study="shhs2") if not args.small else ShhsDataset(study="shhs2")[0:20]
+print("\n[1/5] Dataset...")
 
-train_set, test_set = get_random_split(dataset=dataset)
-train_set, val_set = get_random_split(dataset=train_set)
-print(f"  Subjects: {len(dataset)} total → train {len(train_set)}, val {len(val_set)}, test {len(test_set)}")
+if _singleton:
+    train_set, test_set = get_random_split(dataset=dataset)
+    train_set, val_set = get_random_split(dataset=train_set)
+else:
+    # 已在上面拆好，直接打印
+    dataset = train_set  # 兼容后续引用
+
+msg = f"  total={len(dataset)} → train={len(train_set)}, val={len(val_set)}, test={len(test_set)}"
+if not _singleton:
+    # 打印各子集分布
+    for split_name, split_ds in [("train", train_set), ("val", val_set), ("test", test_set)]:
+        src_counts = split_ds.index["_source"].value_counts().to_dict()
+        parts = ", ".join(f"{k}:{v}" for k, v in sorted(src_counts.items()))
+        msg += f"\n    {split_name}: {parts}"
+print(msg)
 
 # ---------------------------------------------------------------------------
 # 2. 构建序列数据
 # ---------------------------------------------------------------------------
 print("\n[2/5] Preparing sequence data...")
 data_loader = DataPreparation(seq_len=args.seq_len, overlap=None, causal=args.causal)
-x_train, y_train, x_val, y_val, x_test, y_test = data_loader.get_final_tensors(
+x_train, y_train, x_val, y_val, x_test, y_test, scaler = data_loader.get_final_tensors(
     args.modality, train_set, val_set, test_set, args.classification
 )
 print(f"  x_train: {x_train.shape}, y_train: {y_train.shape}")
 print(f"  x_val:   {x_val.shape}, y_val:   {y_val.shape}")
 print(f"  x_test:  {len(x_test)} subjects")
+
+# 混合数据集：为验证集准备子集张量（训练时每 epoch 打印 per-source 指标）
+val_sources_dict = {}
+if not _singleton:
+    for src_name, src_ds in _val_sources.items():
+        xs, ys, _ = data_loader.get_data(
+            src_ds, modality=args.modality, scaler=scaler,  # 复用训练集 scaler
+            classification_type=args.classification, padding=True
+        )
+        val_sources_dict[src_name] = (xs, ys)
+    print(f"  val sources: { {k: v[0].shape[0] for k, v in val_sources_dict.items()} }")
 
 # ---------------------------------------------------------------------------
 # 3. 创建模型
@@ -229,6 +345,7 @@ model = LSTM(
     output_dir=str(OUTPUT_DIR),
     focal_gamma=args.focal_gamma,
     grad_clip=args.grad_clip,
+    val_sources=val_sources_dict if not _singleton else None,
 )
 
 # 加载已有权重 (如果指定)
@@ -293,9 +410,43 @@ conf_pct.round(1).to_csv(results_dir / "confusion_matrix_percent.csv")
 with open(results_dir / "predictions.pickle", "wb") as f:
     pickle.dump(pred_dict, f)
 
+# 按子数据集汇总（混合模式）
+if not _singleton:
+    # 从 prefixed ID 解析来源: "mesasleep@2982" → "mesasleep"
+    def _parse_source(col_name):
+        i = str(col_name).find("@")
+        return str(col_name)[:i] if i > 0 else "unknown"
+    src_conf_matrices = {}
+    print(f"\n{'=' * 60}")
+    print("Per-Source Test Results:")
+    print(f"{'=' * 60}")
+    for src_name in sorted(set(_parse_source(s) for s in subject_results.columns)):
+        src_subjs = [s for s in subject_results.columns if _parse_source(s) == src_name]
+        if not src_subjs:
+            continue
+        numeric_cols = [c for c in subject_results[src_subjs].index
+                        if c != "confusion_matrix"]
+        src_mean = subject_results[src_subjs].loc[numeric_cols].astype(float).mean(axis=1)
+        print(f"\n  [{src_name}]  (n={len(src_subjs)})")
+        for metric in ["accuracy", "kappa", "mcc"]:
+            if metric in src_mean:
+                print(f"    {metric:10s}: {src_mean[metric]:.4f}")
+        src_cm = pd.DataFrame(0, index=sleep_stage_labels, columns=sleep_stage_labels)
+        for s in src_subjs:
+            if "confusion_matrix" in subject_results[s]:
+                src_cm += subject_results[s]["confusion_matrix"].get_value()
+        src_conf_matrices[src_name] = src_cm
+        print(f"    Confusion Matrix (%):")
+        pct = src_cm.div(src_cm.sum(axis=1), axis=0) * 100
+        print(pct.round(1).to_string())
+    for src_name, cm in src_conf_matrices.items():
+        cm.to_csv(results_dir / f"confusion_matrix_{src_name}.csv")
+        (cm.div(cm.sum(axis=1), axis=0) * 100).round(1).to_csv(
+            results_dir / f"confusion_matrix_{src_name}_percent.csv")
+
 # 汇总
 print(f"\n{'=' * 60}")
-print("Test Set Results (mean across subjects):")
+print("Test Set Results (OVERALL mean across subjects):")
 print(score_mean.to_string())
 print(f"{'=' * 60}")
 print(f"All outputs saved to: {OUTPUT_DIR}")
