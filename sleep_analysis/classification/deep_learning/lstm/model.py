@@ -108,7 +108,9 @@ class Model(nn.Module):
 
         # 20260731 - rdwang: forward的时候需要单人整夜数据的mean/std，不符合事实分期的要求，适配实时睡眠分期时要修
         mean_x = x.mean(dim=(0, 1), keepdim=True)
-        std_x = x.std(dim=(0, 1), keepdim=True) + 1e-8  # Avoid division by zero
+        std_x = x.std(dim=(0, 1), keepdim=True) + 1e-5  # Avoid division by zero
+        # ✅20260803 - rdwang: 推理pipeline误差可能是1e-8导致的。AI分析: ONNX 的算子实现和 PyTorch 不同——torch.std(unbiased=True) 在 ONNX 里没有对等算子，dynamo 只能用 ReduceMean（总体方差，除以 n）来近似，在 Feature 1 std≈0 时被 eps=1e-8 放大。
+        # ✅20260804 - rdwang: 提到1e-5之后问题解决。
 
         if torch.isnan(mean_x).any() or torch.isnan(std_x).any():
             print("[DEBUG] Skipping normalization due to NaN in batch statistics")

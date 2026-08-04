@@ -311,6 +311,18 @@ print(f"  x_train: {x_train.shape}, y_train: {y_train.shape}")
 print(f"  x_val:   {x_val.shape}, y_val:   {y_val.shape}")
 print(f"  x_test:  {len(x_test)} subjects")
 
+# 保存第一层 StandardScaler（训练集拟合），推理时必需
+checkpoints_dir = OUTPUT_DIR / "checkpoints"
+checkpoints_dir.mkdir(parents=True, exist_ok=True)
+scaler_path = checkpoints_dir / "scaler.json"
+with open(scaler_path, "w") as f:
+    json.dump({
+        "n_features": int(scaler.n_features_in_),
+        "mean_": scaler.mean_.tolist(),
+        "scale_": scaler.scale_.tolist(),
+    }, f, indent=2)
+print(f"  Scaler saved to: {scaler_path}")
+
 # 混合数据集：为验证集准备子集张量（训练时每 epoch 打印 per-source 指标）
 val_sources_dict = {}
 if not _singleton:
@@ -352,6 +364,12 @@ model = LSTM(
 if args.load_weights:
     print(f"  Loading weights from: {args.load_weights}")
     model._load_best_model_from_path(args.load_weights)
+    # 检查同目录下是否有配套的 scaler.json
+    companion_scaler = Path(args.load_weights).parent / "scaler.json"
+    if companion_scaler.exists():
+        print(f"  Companion scaler found: {companion_scaler}")
+    else:
+        print(f"  [WARN] No companion scaler found at {companion_scaler}")
 
 # ---------------------------------------------------------------------------
 # 4. 训练 (--eval-only 则跳过)
