@@ -28,6 +28,8 @@ from xml.etree import ElementTree
 import numpy as np
 import pandas as pd
 
+import sleep_analysis.processing_config as pc
+
 # ---------------------------------------------------------------------------
 # 纯函数 — 无模块级副作用，可供多进程安全调用
 # ---------------------------------------------------------------------------
@@ -50,7 +52,22 @@ def parse_shhs_xml(xml_path):
 
 
 def generate_r_points_from_ecg(raw_ecg_values, sampling_rate):
-    """neurokit2 自动 R 峰检测。sampling_rate 由 EDF 动态读取，不做硬编码。"""
+    """R 峰自动检测（原版 neurokit2）。sampling_rate 由 EDF 动态读取，不做硬编码。
+
+    当前决策（2026-08-05）: 回退原版 — HRV 相关处理保持与原版一致
+    （HRV 特征实测差异为 0% 量级, 且保持与原版已训练模型的可比性）。
+
+    历史说明: 此前实现了 causal 分支（processing_config.causal 为 True 时改用
+    preprocessing/ecg_rpeaks.rpeaks_causal, 自写因果 Pan-Tompkins）— neurokit2 的
+    ecg_clean (sosfiltfilt 零相位双向滤波, 毫秒级延迟) 与 ecg_peaks
+    (全局梯度/长度阈值) 均非因果。如需启用, 取消下方注释并改为:
+
+        if pc.causal:
+            from sleep_analysis.preprocessing.ecg_rpeaks import rpeaks_causal
+            rpeaks = rpeaks_causal(np.asarray(raw_ecg_values, dtype=float), sampling_rate)
+        else:
+            ...下方原版...
+    """
     import neurokit2 as nk
     ecg_cleaned = nk.ecg_clean(raw_ecg_values, sampling_rate=sampling_rate)
     _, rpeaks_info = nk.ecg_peaks(ecg_cleaned, sampling_rate=sampling_rate)
@@ -90,25 +107,13 @@ def sleep_stage_map(df_psg):
 
 
 def process_rpoint(ecg_df):
-    """R-point → RR 间期 → 去异常 → HR。"""
-    from hrvanalysis import interpolate_nan_values, remove_ectopic_beats, remove_outliers
-    ecg_df = ecg_df[ecg_df["TPoint"] > 0].copy()
-    rr = pd.DataFrame(ecg_df["seconds"].diff() * 1000)
-    rr = rr.rename(columns={"seconds": "RR Intervals"})
-    rr["RR Intervals"] = rr["RR Intervals"].fillna(rr["RR Intervals"].mean())
-    clean = rr["RR Intervals"].values
-    clean = remove_outliers(rr_intervals=clean, low_rri=300, high_rri=2000, verbose=False)
-    clean = interpolate_nan_values(rr_intervals=clean, interpolation_method="linear")
-    clean = remove_ectopic_beats(rr_intervals=clean, method="malik", verbose=False)
-    clean = interpolate_nan_values(rr_intervals=clean)
-    rr["RR Intervals"] = clean
-    hr_df = pd.DataFrame(np.round(60000.0 / rr["RR Intervals"], 0)).rename(columns={"RR Intervals": "HR"})
-    rr["RR Intervals"] = rr["RR Intervals"].fillna(rr["RR Intervals"].mean())
-    ecg_df = pd.concat([ecg_df, hr_df, rr], axis=1)
-    t1 = ecg_df.epoch.value_counts().reset_index()
-    t1.columns = ["epoch_idx", "count"]
-    invalid = set(t1[t1["count"] < 10]["epoch_idx"].values)
-    return ecg_df[~ecg_df["epoch"].isin(list(invalid))]
+    """R-point → RR 间期 → 去异常 → HR。
+
+    已抽到 preprocessing/rr_utils.py（与 MESA 共用, 含 causal 分支）。
+    """
+    from sleep_analysis.preprocessing.rr_utils import process_rpoint as _process_rpoint
+
+    return _process_rpoint(ecg_df)
 
 
 def extract_edf_channel(edf_dir, subj, channel, study_prefix):
@@ -157,15 +162,16 @@ def process_one_subject(cfg):
     from sleep_analysis.feature_extraction.mesa_datasst.rrv import extract_rrv_features_helper
     from sleep_analysis.feature_extraction.mesa_datasst.hrv import calc_hrv_features
     from sleep_analysis.preprocessing.mesa_dataset.respiration import check_resp_features
+    from sleep_analysis.preprocessing.mesa_dataset.edr_placeholder import make_edr_placeholder
 
     t0 = time.time()
     timings = {}
 
     out_edr = out_rrv = out_ecg = out_hrv = out_merge = None
     try:
-        # --- Step 1: EDR ---
+        # --- Step 1: EDR (--no-edr 时跳过, 下游用全 0 占位表) ---
         out_edr = processed_dir / f"edr_respiration_features_raw/edr_respiration{subj}.csv"
-        if not out_edr.exists():
+        if not cfg["no_edr"] and not out_edr.exists():
             raw_ecg, epochs, ecg_rate = extract_edf_channel(edf_dir, subj, channel_ecg, study)
             edr_signal = _extract_edr(raw_ecg, sampling_rate=ecg_rate)
             resp_df, epochs = process_resp(edr_signal.respiratory_signal, epochs,
@@ -217,7 +223,11 @@ def process_one_subject(cfg):
 
             # Respiration & EDR features
             df_resp = pd.read_csv(out_rrv, index_col=0)
-            df_edr = pd.read_csv(out_edr, index_col=0)
+            if cfg["no_edr"] or not out_edr.exists():
+                # EDR 屏蔽: 用 RRV 特征表生成全 0 占位表, 保持下游对齐/合并/训练代码不变
+                df_edr = make_edr_placeholder(df_resp)
+            else:
+                df_edr = pd.read_csv(out_edr, index_col=0)
             df_resp = check_resp_features(df_resp)
             df_edr = check_resp_features(df_edr)
             df_edr.columns = [c.replace("RRV", "EDR") for c in df_edr.columns]
@@ -302,6 +312,10 @@ def main():
     parser.add_argument("--n-subjects", type=int, default=99999)
     parser.add_argument("--n-workers", type=int, default=10,
                         help="并行 worker 数 (默认 10)")
+    parser.add_argument("--no-edr", action="store_true",
+                        help="屏蔽 EDR 处理: 跳过 Step 1, EDR 特征用全 0 占位表替入 (下游代码不变)")
+    parser.add_argument("--output-dir", type=str, default=None,
+                        help="输出目录 (默认 /srv/shared/psgdata/{study}_processed)")
     args = parser.parse_args()
 
     STUDY = args.study
@@ -321,7 +335,13 @@ def main():
         DATASET_CSV = DATASET_DIR / "shhs2-dataset-0.13.0-utf8.csv"
         OVERALL_COL = "overall_shhs2"
 
-    PROCESSED_DIR = Path(f"/srv/shared/psgdata/{STUDY}_processed")
+    PROCESSED_DIR = Path(args.output_dir) if args.output_dir else Path(f"/srv/shared/psgdata/{STUDY}_processed")
+
+    # 目录级模式锁: 跨模式重跑已有目录直接拒绝, 防止静默复用旧模式文件 (reviewer High/Medium)
+    pc.check_run_mode(
+        PROCESSED_DIR,
+        {"causal": pc.causal, "no_edr": args.no_edr, "script": f"preprocess_shhs.py ({STUDY})"},
+    )
 
     print(f"Study: {STUDY}")
     print(f"Output: {PROCESSED_DIR}")
@@ -379,6 +399,7 @@ def main():
         "processed_dir": str(PROCESSED_DIR),
         "channel_ecg": "ECG",
         "channel_resp": "THOR RES",
+        "no_edr": args.no_edr,
     }
 
     # --- 多进程并行处理 ---

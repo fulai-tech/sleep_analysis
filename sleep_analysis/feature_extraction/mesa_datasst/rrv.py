@@ -7,9 +7,11 @@ import matplotlib.pyplot as plt
 import neurokit2 as nk
 import numpy as np
 import pandas as pd
+import scipy.signal
 import tqdm
 from biopsykit.utils.array_handling import sliding_window
 
+import sleep_analysis.processing_config as pc
 from sleep_analysis.feature_extraction.mesa_datasst.utils import check_processed
 from sleep_analysis.preprocessing.utils import extract_edf_channel
 
@@ -94,55 +96,53 @@ def extract_rrv_features_helper(resp_arr, nan_pad=1.0, sampling_rate=32):
         nan=nan_pad,
     )
 
+    # 20260805: 修复异常分支引用未定义变量的 bug (首个窗口异常时 features_150 未定义)
     feature_list = []
+    feature_keys = None  # 首次成功时的特征列名, 供异常窗口填 0 使用
     for resp_150 in resp_arr_150s:
         try:
             peaks = extract_peaks(resp_150, sampling_rate)
             features_150 = calc_rrv_features(resp_150, peaks, sampling_rate)
+            if feature_keys is None:
+                feature_keys = list(features_150[0].keys())
             feature_list.append(features_150[0])
-        except ValueError:
-            print("handle Value-Error")
-            feature_list.append(dict.fromkeys(features_150[0], 0))
-            continue
-        except IndexError:
-            print("handle Index-Error")
-            feature_list.append(dict.fromkeys(features_150[0], 0))
+        except (ValueError, IndexError):
+            print("handle peak-detection error (150s window)")
+            feature_list.append(dict.fromkeys(feature_keys or [], 0))
             continue
 
     features = pd.DataFrame(feature_list).add_prefix("150_")
 
     feature_list = []
+    feature_keys = None
     for resp_210 in resp_arr_210s:
         try:
             peaks = extract_peaks(resp_210, sampling_rate)
             features_210 = calc_rrv_features(resp_210, peaks, sampling_rate)
+            if feature_keys is None:
+                feature_keys = list(features_210[0].keys())
             feature_list.append(features_210[0])
 
-        except ValueError:
-            print("handle Value-Error")
-            feature_list.append(dict.fromkeys(features_210[0], 0))
-            continue
-        except IndexError:
-            print("handle Index-Error")
-            feature_list.append(dict.fromkeys(features_210[0], 0))
+        except (ValueError, IndexError):
+            print("handle peak-detection error (210s window)")
+            feature_list.append(dict.fromkeys(feature_keys or [], 0))
             continue
 
     features = pd.concat([features, pd.DataFrame(feature_list).add_prefix("210_")], axis=1)
 
     feature_list = []
+    feature_keys = None
     for resp_270 in resp_arr_270s:
         try:
             peaks = extract_peaks(resp_270, sampling_rate)
             features_270 = calc_rrv_features(resp_270, peaks, sampling_rate)
+            if feature_keys is None:
+                feature_keys = list(features_270[0].keys())
             feature_list.append(features_270[0])
 
-        except ValueError:
-            print("handle Value-Error")
-            feature_list.append(dict.fromkeys(features_270[0], 0))
-            continue
-        except IndexError:
-            print("handle Index-Error")
-            feature_list.append(dict.fromkeys(features_270[0], 0))
+        except (ValueError, IndexError):
+            print("handle peak-detection error (270s window)")
+            feature_list.append(dict.fromkeys(feature_keys or [], 0))
             continue
 
     features = pd.concat([features, pd.DataFrame(feature_list).add_prefix("270_")], axis=1)
@@ -206,8 +206,54 @@ def process_resp(resp_df, epochs, sampling_rate_in=256):
     return resp_df, epochs
 
 
+def _rsp_clean_causal(resp_signal: np.ndarray, sampling_rate: int) -> np.ndarray:
+    """因果版呼吸信号清洗 — 与 nk.rsp_clean(method="biosppy") 同参数，但只使用已见数据。
+
+    原版 (neurokit2 _rsp_clean_biosppy): butter(2) bandpass [0.1, 0.35] Hz + filtfilt
+    （零相位双向滤波, 未来泄漏）+ detrend(0)（减整夜均值, 未来泄漏）。
+
+    因果版: 同参数 butter(2) + lfilter（正向滤波, zi 稳态初始化）。
+    去掉 detrend(0): 它减去整夜均值（未来泄漏）；0.1Hz 高通已去除基线漂移，影响极小。
+    """
+    b, a = scipy.signal.butter(N=2, Wn=[0.1, 0.35], btype="bandpass", fs=sampling_rate)
+    zi = scipy.signal.lfilter_zi(b, a) * resp_signal[0]
+    cleaned, _ = scipy.signal.lfilter(b, a, resp_signal, zi=zi)
+    return cleaned
+
+
+def _downsample_causal(data: np.ndarray, sampling_rate_in: int, sampling_rate_out: int) -> np.ndarray:
+    """因果版降采样。
+
+    原版 (biopsykit downsample): 整数比用 decimate（因果）; 非整数比用
+    filtfilt(cheby1(8) 抗混叠) + 线性插值（双向滤波, 未来泄漏, SHHS1 125Hz / SHHS2 250Hz 会走此分支）。
+
+    因果版: 整数比保持 decimate 但显式 zero_phase=False（scipy 1.13 默认 True=内部 filtfilt,
+    非因果 — 原版 MESA 256→32 实际走的就是 filtfilt）; 非整数比将抗混叠滤波换成
+    lfilter（因果, zi 稳态初始化），参数与原版完全相同 (cheby1 N=8, rp=0.05, Wn=0.8/(fs_in/fs_out))，
+    插值保持线性。残余向前依赖仅 1 个原始样本（≤8ms@125Hz, ≤16ms@250Hz），远小于 30s epoch，可忽略。
+    """
+    if (sampling_rate_in / sampling_rate_out) % 1 == 0:
+        return scipy.signal.decimate(
+            data, int(sampling_rate_in / sampling_rate_out), axis=0, zero_phase=False
+        )
+
+    b, a = scipy.signal.cheby1(N=8, rp=0.05, Wn=0.8 / (sampling_rate_in / sampling_rate_out))
+    zi = scipy.signal.lfilter_zi(b, a) * data[0]
+    data_lp, _ = scipy.signal.lfilter(b, a, data, zi=zi)
+
+    x_old = np.linspace(0, len(data_lp), num=len(data_lp), endpoint=False)
+    x_new = np.linspace(0, len(data_lp), num=int(len(data_lp) / (sampling_rate_in / sampling_rate_out)), endpoint=False)
+    return np.interp(x_new, x_old, data_lp)
+
+
 def _downsample_resp(resp_df, sampling_rate_in: int, sampling_rate_out: int):
     # 20260729 - rdwang: 这里是全部数据直接做的双向滤波，不符合事实睡眠分期的需求，要改整个处理链路
+    # 20260804 - rdwang: 已加 causal 分支（processing_config.causal=True 时用正向滤波 + 因果降采样）
+    if pc.causal:
+        # 单列 DataFrame 拉平为 1-D (原版 nk.rsp_clean 内部也是取单列)
+        cleaned = _rsp_clean_causal(np.asarray(resp_df, dtype=float).ravel(), sampling_rate_in)
+        return _downsample_causal(cleaned, sampling_rate_in, sampling_rate_out)
+
     cleaned = nk.rsp_clean(resp_df, sampling_rate=sampling_rate_in, method="biosppy")
 
     return bp.utils.array_handling.downsample(np.asarray(cleaned), sampling_rate_in, sampling_rate_out)

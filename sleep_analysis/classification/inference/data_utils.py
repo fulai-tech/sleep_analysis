@@ -160,6 +160,12 @@ def build_sequences(
     seq_len : int  窗口长度 (epoch 数)
     causal : bool  是否实时模式 (仅历史 padding)
 
+    注意: 此 causal 只控制序列窗口的 padding 方向（模型输入层, 由训练时 config.json 的
+    "causal" 决定），与 sleep_analysis.processing_config.causal（数据生成阶段的 RRV
+    滤波/降采样因果性, 由 SLEEP_CAUSAL 环境变量决定, 固化在特征文件中）是**两个独立
+    开关**。推理引擎的 causal=True 不使 RR 间期预处理（process_rpoint, 当前永久原版）
+    或特征提取变得因果 — 特征的因果性由数据生成时决定。
+
     Returns
     -------
     x : np.ndarray  shape (n_epochs, seq_len, n_features)

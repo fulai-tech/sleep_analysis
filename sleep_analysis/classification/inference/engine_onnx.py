@@ -56,7 +56,7 @@ class OnnxInferenceEngine:
         self.num_classes = get_num_classes(self.classification_type)
         self.input_size = get_num_input(self.modality)
         self.seq_len = self.config.get("seq_len", 21)
-        self.causal = self.config.get("causal", False)
+        self.causal = self.config.get("causal", False)  # 注意: 只控制序列 padding 方向, 与 processing_config.causal (数据生成) 无关
 
         # 加载第一层 scaler
         self.scaler_mean, self.scaler_scale = load_scaler(self.run_dir)

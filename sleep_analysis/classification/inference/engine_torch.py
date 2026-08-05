@@ -61,7 +61,7 @@ class TorchInferenceEngine:
         self.num_layers = self.config["num_layers"]
         self.dropout = self.config["dropout"]
         self.seq_len = self.config.get("seq_len", 21)
-        self.causal = self.config.get("causal", False)
+        self.causal = self.config.get("causal", False)  # 注意: 只控制序列 padding 方向, 与 processing_config.causal (数据生成) 无关
 
         # 设备
         if device == "auto":
