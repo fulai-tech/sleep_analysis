@@ -74,6 +74,9 @@ _DATASET_PROCESSED_KEYS = {
     "shhs2": "shhs2_processed_path",
 }
 
+# 复用 data_utils 的路径解析 (MESA/SHHS 自适应)
+from sleep_analysis.classification.inference.data_utils import resolve_data_paths  # noqa: E402
+
 
 def resolve_paths(
     subject_id: str,
@@ -82,6 +85,9 @@ def resolve_paths(
 ) -> tuple[Path, Path]:
     """
     根据被试编号和数据集名称解析特征文件和标注文件路径。
+
+    MESA: 标注在 actigraph_data_clean/
+    SHHS: 标注在 sleep_stages/ (无体动记录)
 
     Returns
     -------
@@ -95,22 +101,11 @@ def resolve_paths(
         )
 
     processed = Path(study_cfg[key])
-
-    feat_path = processed / "features_full_combined" / f"features_combined{subject_id}.csv"
-    if not feat_path.exists():
-        raise FileNotFoundError(f"Feature file not found: {feat_path}")
-
-    gt_path = processed / "actigraph_data_clean" / f"actigraph_data_clean{subject_id}.csv"
-    if not gt_path.exists():
-        # SHHS 标注可能在别的位置，尝试 shhs_ground_truth
-        gt_alt = processed / "shhs_ground_truth" / f"ground_truth_{subject_id}.csv"
-        if gt_alt.exists():
-            gt_path = gt_alt
-        else:
-            raise FileNotFoundError(
-                f"Ground truth not found at {gt_path} or {gt_alt}"
-            )
-
+    feat_path, gt_path = resolve_data_paths(subject_id, processed)
+    if gt_path is None:
+        raise FileNotFoundError(
+            f"Ground truth not found for {subject_id} in {processed}"
+        )
     return feat_path, gt_path
 
 

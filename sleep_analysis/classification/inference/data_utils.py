@@ -130,30 +130,12 @@ def select_features(feature_df: pd.DataFrame, modality: List[str]) -> pd.DataFra
 def select_features_for_shhs(feature_df: pd.DataFrame, modality: List[str]) -> pd.DataFrame:
     """
     SHHS 数据集特征选择 — 与训练时 ShhsDataset._extract_subj_features 一致。
-    SHHS 的 HRV 特征列名前缀略有不同（无前导下划线）。
+
+    注意: SHHS 的 HRV 列名与 MESA 相同 (带前导下划线 `_hrv_*`)，
+    因此直接委托 select_features 即可。此前曾错误地对列名做 lstrip("_")
+    (见 review)，导致 SHHS HRV 特征永远选不到。
     """
-    parts = []
-    for mod in ("ACT", "HRV", "RRV", "EDR"):
-        if mod not in modality:
-            continue
-        if mod == "ACT":
-            cols = [c for c in _ACT_COLUMNS if c in feature_df.columns]
-            parts.append(feature_df[cols])
-        elif mod == "HRV":
-            hrv = feature_df.filter(regex="hrv")
-            # SHHS HRV columns don't have leading underscore
-            shhs_hrv_cols = [c.lstrip("_") if c.startswith("_") else c for c in _HRV_COLUMNS]
-            cols = [c for c in shhs_hrv_cols if c in hrv.columns]
-            parts.append(hrv[cols])
-        elif mod == "RRV":
-            rrv = feature_df.filter(regex="RRV")
-            cols = [c for c in _RRV_COLUMNS if c in rrv.columns]
-            parts.append(rrv[cols])
-        elif mod == "EDR":
-            edr = feature_df.filter(regex="EDR")
-            cols = [c for c in _EDR_COLUMNS if c in edr.columns]
-            parts.append(edr[cols])
-    return pd.concat(parts, axis=1)
+    return select_features(feature_df, modality)
 
 
 # ---------------------------------------------------------------------------
@@ -272,12 +254,46 @@ def load_features_from_path(feature_path: Path) -> pd.DataFrame:
     return pd.read_csv(feature_path, index_col=0)
 
 
+def resolve_data_paths(
+    subject_id: str,
+    processed_path: Path,
+) -> Tuple[Path, Optional[Path]]:
+    """
+    根据被试编号和预处理目录解析特征文件与标注文件路径。
+
+    不同数据集目录结构不同:
+      - MESA: 标注在 actigraph_data_clean/actigraph_data_clean{id}.csv
+      - SHHS: 标注在 sleep_stages/sleep_stages{id}.csv (无体动记录)
+      - 标注缺失时返回 None (仅推理, 不评估)
+
+    Returns
+    -------
+    (feature_path, ground_truth_path)
+    """
+    feat_path = processed_path / "features_full_combined" / f"features_combined{subject_id}.csv"
+    if not feat_path.exists():
+        raise FileNotFoundError(
+            f"Feature file not found: {feat_path}. "
+            "请先运行预处理管线或检查被试编号。"
+        )
+
+    # MESA
+    gt_path = processed_path / "actigraph_data_clean" / f"actigraph_data_clean{subject_id}.csv"
+    # SHHS
+    if not gt_path.exists():
+        gt_path = processed_path / "sleep_stages" / f"sleep_stages{subject_id}.csv"
+    if not gt_path.exists():
+        gt_path = None
+
+    return feat_path, gt_path
+
+
 def load_ground_truth(
     subject_id: str,
     processed_path: Path,
 ) -> pd.DataFrame:
     """
-    加载指定被试的睡眠分期标注。
+    加载指定被试的睡眠分期标注 (MESA / SHHS 自适应)。
 
     Parameters
     ----------
@@ -288,10 +304,15 @@ def load_ground_truth(
     -------
     gt : pd.DataFrame  包含列: sleep, 5stage, 4stage, 3stage
     """
-    gt_path = processed_path / "actigraph_data_clean" / f"actigraph_data_clean{subject_id}.csv"
-    if not gt_path.exists():
-        raise FileNotFoundError(f"Ground truth file not found: {gt_path}")
-    return pd.read_csv(gt_path)[["line", "sleep", "5stage", "4stage", "3stage"]]
+    _, gt_path = resolve_data_paths(subject_id, processed_path)
+    if gt_path is None:
+        raise FileNotFoundError(
+            f"Ground truth not found for {subject_id} in {processed_path} "
+            "(searched actigraph_data_clean/ and sleep_stages/)"
+        )
+    df = pd.read_csv(gt_path)
+    cols = [c for c in ["line", "sleep", "5stage", "4stage", "3stage"] if c in df.columns]
+    return df[cols]
 
 
 def load_ground_truth_from_path(

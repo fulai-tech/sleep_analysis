@@ -23,6 +23,7 @@ from sleep_analysis.classification.inference.data_utils import (
     load_ground_truth_from_path,
     load_run_config,
     load_scaler,
+    resolve_data_paths,
     select_features,
 )
 
@@ -109,9 +110,8 @@ class OnnxInferenceEngine:
         subject_id: str,
         processed_path: Path,
     ) -> Tuple[np.ndarray, np.ndarray]:
-        """对单个被试推理 (按被试编号从标准目录加载)。"""
-        feat_path = processed_path / "features_full_combined" / f"features_combined{subject_id}.csv"
-        gt_path = processed_path / "actigraph_data_clean" / f"actigraph_data_clean{subject_id}.csv"
+        """对单个被试推理 (按被试编号从标准目录加载, MESA/SHHS 自适应)。"""
+        feat_path, gt_path = resolve_data_paths(subject_id, processed_path)
         return self.predict_from_files(feat_path, gt_path, subject_id)
 
     def predict_from_files(
