@@ -247,8 +247,8 @@ def _downsample_causal(data: np.ndarray, sampling_rate_in: int, sampling_rate_ou
 
 
 def _downsample_resp(resp_df, sampling_rate_in: int, sampling_rate_out: int):
-    # 20260729 - rdwang: 这里是全部数据直接做的双向滤波，不符合事实睡眠分期的需求，要改整个处理链路
-    # 20260804 - rdwang: 已加 causal 分支（processing_config.causal=True 时用正向滤波 + 因果降采样）
+    # ✅20260729 - rdwang: 这里是全部数据直接做的双向滤波，不符合事实睡眠分期的需求，要改整个处理链路
+    # ✅20260805 - rdwang: 已加 causal 分支（processing_config.causal=True 时用正向滤波 + 因果降采样）
     if pc.causal:
         # 单列 DataFrame 拉平为 1-D (原版 nk.rsp_clean 内部也是取单列)
         cleaned = _rsp_clean_causal(np.asarray(resp_df, dtype=float).ravel(), sampling_rate_in)

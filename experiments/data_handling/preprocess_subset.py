@@ -150,13 +150,9 @@ def process_one_subject(cfg: dict):
         return (subj, True, {"timings": timings})
 
     except Exception as e:
-        # 清理半成品
-        for p in [out_edr, out_rrv, out_ecg, out_act, out_hrv]:
-            try:
-                if p is not None:
-                    p.unlink(missing_ok=True)
-            except Exception:
-                pass
+        # 20260806: 不再清理"半成品" — 原逻辑会把 Step 2 已成功生成的 RRV
+        # raw 文件也删掉 (Step 3 失败连带误删, 重跑时白白重算)。
+        # 失败被试不进 checkpoint, 重跑会重新生成所有文件, 半成品自然被覆盖, 无需清理。
         return (subj, False, {"reason": str(e)[:200]})
 
 

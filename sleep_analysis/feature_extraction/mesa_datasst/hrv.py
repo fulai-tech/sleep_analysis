@@ -30,7 +30,8 @@ def extract_hrv_features(overwrite=True):
     """
 
     path_list = list(processed_mesa_path.joinpath("actigraph_data_clean").glob("*.csv"))
-    mesa_id = re.findall("(\d{4})", str(path_list))
+    # 20260805: 只从文件名提取 ID, 避免路径中的日期数字污染
+    mesa_id = [re.findall(r"(\d{4})\.csv", f.name)[0] for f in path_list]
     with tqdm.tqdm(total=len(mesa_id)) as progress_bar:
         for subj in mesa_id:
             if not overwrite:  # check if file already exists

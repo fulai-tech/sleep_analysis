@@ -18,7 +18,10 @@ class MesaDataset(Dataset):
 
         path = path.joinpath("features_full_combined").resolve()
         path_list = list(Path(path).glob("*.csv"))
-        subj_id = re.findall("(\d{4})", str(path_list))
+        # 20260805: 与 merge_features 同样的修复 — 只从文件名提取 ID,
+        # 避免路径中的日期数字 (如 processed_data_no_leak_20260805 的 2026/0805)
+        # 被当成伪被试 ID (会读取不存在的 features_combined2026.csv 崩溃)
+        subj_id = [re.findall(r"(\d{4})\.csv", f.name)[0] for f in path_list]
         return pd.DataFrame(subj_id, columns=["subj_id"])
 
     @property

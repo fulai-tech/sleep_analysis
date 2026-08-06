@@ -32,11 +32,12 @@ def check_mesa_data_availability(mesa_path, processed_mesa_path):
     path_list_resp = list(Path(path_resp).glob("*.csv"))
     path_list_edr = list(Path(edr_path).glob("*.csv"))
 
-    mesa_id_actigraphy = set(re.findall("(\d{4})", str(path_list_actigraphy)))
-    mesa_id_psg = set(re.findall("(\d{4})", str(path_list_psg)))
-    mesa_id_r_point = set(re.findall("(\d{4})", str(path_list_r_point_path)))
-    mesa_id_resp = set(re.findall("(\d{4})", str(path_list_resp)))
-    mesa_id_edr = set(re.findall("(\d{4})", str(path_list_edr)))
+    # 20260805: 只从文件名提取 ID, 避免路径中的日期数字污染
+    mesa_id_actigraphy = {re.findall(r"(\d{4})\.csv", p.name)[0] for p in path_list_actigraphy}
+    mesa_id_psg = {re.findall(r"(\d{4})\.xml", p.name)[0] for p in path_list_psg}
+    mesa_id_r_point = {re.findall(r"(\d{4})\.csv", p.name)[0] for p in path_list_r_point_path}
+    mesa_id_resp = {re.findall(r"(\d{4})\.csv", p.name)[0] for p in path_list_resp}
+    mesa_id_edr = {re.findall(r"(\d{4})\.csv", p.name)[0] for p in path_list_edr}
     mesa_id_overlap = set(overlap["mesaid"].apply(str).apply(lambda x: x.zfill(4)).tolist())
 
     # set.intersection(set1, set2 ... etc) # Method to find intersection between two or more sets

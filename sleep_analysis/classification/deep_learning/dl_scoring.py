@@ -123,7 +123,8 @@ def dl_multiclass_specificity(y_true, y_pred, labels, average="weighted"):
         fp = np.sum(conf_matrix[l, :]) - conf_matrix[l][l]
         fn = np.sum(conf_matrix[:, l]) - conf_matrix[l][l]
 
-        weight = np.sum(y_true == label)[0] / len(y_true)
+        # 20260806: .values 转 numpy, 消除 DataFrame.sum(axis=None) FutureWarning
+        weight = np.sum((y_true == label).values) / len(y_true)
         weights.append(weight)
 
         value = np.nan_to_num(tn / (tn + fp))

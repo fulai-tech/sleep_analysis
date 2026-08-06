@@ -27,7 +27,8 @@ def extract_edr_features(overwrite=False):
 
     """
     path_list = list(Path(edf_path).glob("*.edf"))
-    mesa_id = re.findall("(\d{4})", str(path_list))
+    # 20260805: 只从文件名提取 ID, 避免路径中的日期数字污染
+    mesa_id = [re.findall(r"(\d{4})\.edf", f.name)[0] for f in path_list]
 
     with tqdm.tqdm(total=len(mesa_id)) as progress_bar:
         for subj in mesa_id:

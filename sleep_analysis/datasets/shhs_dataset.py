@@ -50,7 +50,9 @@ class ShhsDataset(Dataset):
         path = self._config["processed_path"] / "features_full_combined"
         path_list = list(path.glob("*.csv"))
         # SHHS ID 为 6 位数字
-        subj_id = re.findall(r"(\d{6})", str(path_list))
+        # 20260805: 与 merge_features 同样的修复 — 只从文件名提取 ID,
+        # 避免路径中的日期数字被当成伪被试 ID
+        subj_id = [re.findall(r"(\d{6})\.csv", f.name)[0] for f in path_list]
         return pd.DataFrame(subj_id, columns=["subj_id"])
 
     @property
