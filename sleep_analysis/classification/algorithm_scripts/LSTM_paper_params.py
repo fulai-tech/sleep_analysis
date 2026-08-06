@@ -29,12 +29,18 @@ import argparse
 import json
 import pickle
 import random
+import shutil
+import warnings
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+
+# 20260806: 屏蔽第三方/历史代码的 FutureWarning 噪音 (pandas 位置索引弃用等),
+# 训练日志只保留关键信息
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 from sleep_analysis.classification.deep_learning.lstm.data_peparation import DataPreparation
 from sleep_analysis.classification.deep_learning.lstm.LSTM import LSTM
@@ -52,6 +58,9 @@ parser = argparse.ArgumentParser(description="LSTM Sleep Stage Classification")
 parser.add_argument("-d", "--dataset", default="MESA_Sleep",
                     help="数据集: MESA_Sleep / SHHS1 / SHHS2 / MESA_Sleep+SHHS2 等任意 '+' 组合")
 parser.add_argument("--small", action="store_true", help="只用 20 个被试验证管线")
+parser.add_argument("--split-file", type=str, default=None,
+                    help="划分名单 JSON (含 train/val/test 三个被试 ID 数组); "
+                         "指定后按名单划分而非随机划分 (保证跨数据集/实验可比)")
 # 分类
 parser.add_argument("-c", "--classification", default="5stage",
                     choices=["binary", "3stage", "4stage", "5stage"])
@@ -235,6 +244,12 @@ RUN_TIMESTAMP = datetime.now().strftime("%Y-%m-%d_%H%M%S")
 OUTPUT_DIR = PROJECT_ROOT / "exports_our" / RUN_TIMESTAMP
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+# 20260806: 记录本次训练使用的数据来源 — study_data.json 可能随时更改
+# (MESA/SHHS 路径切换等), 训练时把快照复制到 run 目录, 保证事后可追溯
+with open(PROJECT_ROOT / "study_data.json") as _f:
+    _study_cfg = json.load(_f)
+shutil.copy(PROJECT_ROOT / "study_data.json", OUTPUT_DIR / "study_data.json")
+
 # 将所有配置保存为 JSON，以后随时查阅
 config = {
     "timestamp": RUN_TIMESTAMP,
@@ -255,6 +270,12 @@ config = {
     "causal": args.causal,
     "seed": args.seed,
     "load_weights": args.load_weights,
+    # 数据来源 (完整快照见同目录 study_data.json)
+    "data_paths": {
+        "processed_mesa_path_hpc": _study_cfg.get("processed_mesa_path_hpc"),
+        "shhs1_processed_path": _study_cfg.get("shhs1_processed_path"),
+        "shhs2_processed_path": _study_cfg.get("shhs2_processed_path"),
+    },
 }
 with open(OUTPUT_DIR / "config.json", "w") as f:
     json.dump(config, f, indent=2)
@@ -283,7 +304,37 @@ print("=" * 60)
 
 print("\n[1/5] Dataset...")
 
-if _singleton:
+if args.split_file is not None:
+    # 20260806: 按名单划分 (--split-file) — 用固定的 train/val/test ID 列表,
+    # 保证跨数据集/跨实验划分一致 (train_test_split 的 shuffle 依赖被试总数,
+    # 1121 vs 1120 会把整个划分打乱, 两次实验无法严格对比)
+    if not _singleton:
+        raise ValueError("--split-file 目前仅支持单数据集 (MESA_Sleep / SHHS1 / SHHS2)")
+    with open(args.split_file) as _f:
+        _split = json.load(_f)
+    _want = {k: set(v) for k, v in _split.items()}
+    # subj_id 可能带 "source@" 前缀 (MixedDataset), 统一取 "@" 之后
+    _ids = [str(s).split("@")[-1] for s in dataset.index["subj_id"]]
+    _id_set = set(_ids)
+    train_set = dataset[[i for i, sid in enumerate(_ids) if sid in _want["train"]]]
+    val_set = dataset[[i for i, sid in enumerate(_ids) if sid in _want["val"]]]
+    test_set = dataset[[i for i, sid in enumerate(_ids) if sid in _want["test"]]]
+
+    # 20260806: 数据与 split 名单一致性告警 (双向检查)
+    _in_split_not_data = sorted((_want["train"] | _want["val"] | _want["test"]) - _id_set)  # 名单有但数据无
+    _in_data_not_split = sorted(_id_set - (_want["train"] | _want["val"] | _want["test"]))  # 数据有但名单无
+    if _in_split_not_data or _in_data_not_split:
+        print("[WARNING] 数据与 split 名单不一致!")
+        if _in_split_not_data:
+            print(f"  [WARNING] 名单中有但数据缺失 {len(_in_split_not_data)} 个: {_in_split_not_data}")
+        if _in_data_not_split:
+            print(f"  [WARNING] 数据中有但名单缺失 {len(_in_data_not_split)} 个: {_in_data_not_split}")
+    for _k in ("train", "val", "test"):
+        _n_actual = len(locals()[f"{_k}_set"].index)
+        _n_want = len(_want[_k])
+        _flag = "  ← 不一致" if _n_actual != _n_want else ""
+        print(f"[SPLIT] {_k}: 名单 {_n_want} -> 实际 {_n_actual}{_flag}")
+elif _singleton:
     train_set, test_set = get_random_split(dataset=dataset)
     train_set, val_set = get_random_split(dataset=train_set)
 else:
