@@ -173,18 +173,17 @@ def build_sequences(
     n_epochs, n_features = features.shape
 
     if causal:
-        # 仅在左侧垫 (seq_len - 1) 个均值
-        pad_left, pad_right = seq_len - 1, 0
+        # 仅在左侧垫 (seq_len - 1) 个首值 — 实时语义 (只有最早到达的数据, 无未来依赖)
+        # 2026-08-07: 原为整夜均值填充 (含未来 epoch), 与 data_peparation.py 的 mode="edge" 同步
+        padded = np.pad(features, ((seq_len - 1, 0), (0, 0)), mode="edge")
     else:
-        # 居中：左右各垫一半
+        # 居中：左右各垫一半, 均值填充 (原版, 复现作者路径)
         pad_left = seq_len // 2
         pad_right = seq_len // 2
-
-    # 使用均值填充
-    mean_vals = features.mean(axis=0, keepdims=True)
-    pad_left_arr = np.tile(mean_vals, (pad_left, 1))
-    pad_right_arr = np.tile(mean_vals, (pad_right, 1))
-    padded = np.concatenate([pad_left_arr, features, pad_right_arr], axis=0)
+        mean_vals = features.mean(axis=0, keepdims=True)
+        pad_left_arr = np.tile(mean_vals, (pad_left, 1))
+        pad_right_arr = np.tile(mean_vals, (pad_right, 1))
+        padded = np.concatenate([pad_left_arr, features, pad_right_arr], axis=0)
 
     # 滑动窗口：与 biopsykit sliding_window(overlap_percent=None, window_samples=seq_len) 一致
     n_windows = padded.shape[0] - seq_len + 1

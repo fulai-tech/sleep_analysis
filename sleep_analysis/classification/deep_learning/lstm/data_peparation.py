@@ -68,12 +68,18 @@ class DataPreparation:
         ground_truth_arr = np.asarray(ground_truth)
 
         # 20260731 - rdwang: 确定padding有数据泄漏，无法用于实时分期，具体待查
+        # 2026-08-07 - rdwang: causal 分支 padding 值从整夜均值改为首值 (mode="edge")
+        #   原 mode="mean" 用整夜特征均值(含未来 epoch)填充, 序列开头窗口受未来影响;
+        #   mode="edge" 用第一帧特征值填充 (实时语义: 开始时只有最早到达的数据, 无泄漏)。
+        #   scaler 是逐特征线性变换, 与 edge-pad 可交换 → 等价于"先 scale 再首值 pad"。
+        #   非 causal 分支保持原版 (mode="mean", 复现作者路径不动)。
         if padding:
             if self.causal:
                 npad = ((self.seq_len - 1, 0), (0, 0))   # 只垫历史，预测最后时刻
+                feature_arr = np.pad(feature_arr, npad, mode="edge")
             else:
                 npad = ((int(self.seq_len / 2), int(self.seq_len / 2)), (0, 0))  # 居中，原文方式
-            feature_arr = np.pad(feature_arr, npad, mode="mean")
+                feature_arr = np.pad(feature_arr, npad, mode="mean")
             y_mat = ground_truth_arr
             x_mat = bp.utils.array_handling.sliding_window(
                 feature_arr.squeeze(), overlap_percent=self.overlap, window_samples=self.seq_len
