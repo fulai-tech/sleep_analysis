@@ -54,6 +54,63 @@ def extract_rrv_features(overwrite=False):
             print("Features extraction of RRV of subj: " + subj + " finished!")
 
 
+def _extract_rrv_features_causal(resp_arr, nan_pad=1.0, sampling_rate=32):
+    """左对齐回顾窗口版本（严格因果, 实时分期用）。
+
+    与原版（伪居中）的差异:
+      - 窗口: epoch j 的特征 = 数据 [j-W+1, j]（含当前 epoch, W=5/7/9 epoch），
+        而非原版的 [j-p, j+p]（向前看 p 个 epoch 的未来数据）
+      - 首部: 前 W-1 个 epoch 的窗口用信号首值填充补齐（已见数据, 不引入未来信息），
+        因此**不丢行**, 行数仍为 n_epochs（与下游 merge/ground_truth 行对齐完全兼容）
+      - 尾部: 无 pad（左对齐窗口天然覆盖到数据末尾, 不会取到 pad 区）
+
+    与 make_left_aligned_features.py 的平移数据在 epoch >= max(W)=9 区域特征值完全一致
+    （同样的窗口数据 → 同样的特征, 只是特征函数对窗口的确定性计算）。
+
+    实现: 信号首部 pad (W-1) 个 epoch 的首值 → sliding_window 左对齐切窗 →
+    窗口行 k 覆盖原始 epoch [k-W+1, k]（0-based）→ 赋给 1-based epoch k+1。
+    """
+    fs = sampling_rate
+    arr = np.asarray(resp_arr, dtype=float).ravel()
+
+    parts = []
+    for W_epochs, prefix in [(5, "150_"), (7, "210_"), (9, "270_")]:
+        # 首部 pad (W-1) 个 epoch 的首值 (已见数据)
+        pad_samples = (W_epochs - 1) * 30 * fs
+        padded = np.concatenate([np.full(pad_samples, arr[0]), arr])
+        windows = sliding_window(padded, W_epochs * 30 * fs, overlap_samples=(W_epochs * 30 - 30) * fs)
+        windows = np.nan_to_num(windows, nan=nan_pad)
+
+        feature_list = []
+        feature_keys = None
+        for win in windows:
+            try:
+                peaks = extract_peaks(win, fs)
+                feats = calc_rrv_features(win, peaks, fs)
+                if feature_keys is None:
+                    feature_keys = list(feats[0].keys())
+                feature_list.append(feats[0])
+            except (ValueError, IndexError):
+                print(f"handle peak-detection error ({prefix} causal)")
+                feature_list.append(dict.fromkeys(feature_keys or [], 0))
+        parts.append(pd.DataFrame(feature_list).add_prefix(prefix))
+
+    features = pd.concat(parts, axis=1)
+
+    features.replace([np.inf, -np.inf], np.nan, inplace=True)
+    features.fillna(0.0, inplace=True)
+
+    time_axis = resp_arr.index.round("30s").drop_duplicates()[0 : features.shape[0]]
+    features.index = time_axis
+    features["epoch"] = np.arange(1, features.shape[0] + 1)
+
+    if features.shape[1] == 70:
+        print("length 70")
+        features = features[features.columns.drop(list(features.filter(regex="210_RRV_DFA")))]
+
+    return features
+
+
 def extract_rrv_features_helper(resp_arr, nan_pad=1.0, sampling_rate=32):
     # 20260729 - rdwang: 注释和代码不一致，作者实际用的是5个epoch、7个epoch、9个epoch，分别对应2.5min、3.5min、4.5min，与当前注释不一致
     """
@@ -65,6 +122,11 @@ def extract_rrv_features_helper(resp_arr, nan_pad=1.0, sampling_rate=32):
     :param resp_arr: respiration datastream
     :param nan_pad: value to pad NaN values with
     """
+
+    # 20260806: causal 分支 (SLEEP_CAUSAL=1) — 左对齐回顾窗口, 严格因果
+    # (epoch j 的特征只依赖 [j-W+1, j] 的已见数据, 详见 _extract_rrv_features_causal)
+    if pc.causal:
+        return _extract_rrv_features_causal(resp_arr, nan_pad=nan_pad, sampling_rate=sampling_rate)
 
     # resp_arr_30s = sliding_window(resp_arr, 30*32, overlap_samples=0)
 

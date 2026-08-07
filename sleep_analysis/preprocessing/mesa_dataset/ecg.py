@@ -1,10 +1,10 @@
 """ECG R 点 → RR 间期 → HR 的清洗入口。
 
-process_rpoint 已抽到 preprocessing/rr_utils.py（MESA / SHHS 共用, 含 causal 分支），
+process_rpoint 已抽到 preprocessing/rr_utils.py（MESA / SHHS 共用），
 这里仅做转发以保持既有调用方（preprocess_mesa.py / inference_full.py）兼容。
 
-20260804 - rdwang: 原实现的非因果差值（双向插值 + 整夜均值 + malik 前瞻一拍）
-已由 rr_utils.process_rpoint 的 causal 分支替代（processing_config.causal=True 时生效）。
+2026-08-05 决策: HRV 相关处理回退原版（hrvanalysis 非因果流程, 与原版已训练模型
+保持可比性; causal 实现注释保留在 rr_utils.py, 见其顶部决策说明）。
 """
 
 from sleep_analysis.preprocessing.rr_utils import process_rpoint
