@@ -106,7 +106,7 @@ class Model(nn.Module):
         if len(x.shape) == 2:
             x = x.reshape(x.shape[0], x.shape[1], 1)
         # ✅20260731 - rdwang: forward的时候需要单人整夜数据的mean/std，不符合事实分期的要求，适配实时睡眠分期时要修
-        # ✅2026-08-07 - rdwang: 去掉内部 per-batch 归一化（方案 A: 只保留外部 scaler）
+        # ✅2026-08-07 - rdwang: 去掉内部 per-batch 归一化（外部 scaler 作为唯一归一化）
         #   原因: 1) 外部 scaler 已做逐特征 z-score (训练集拟合, 无泄漏),
         #            内部再归一化是冗余的双重标准化 (还把个体/夜间水平信息抹掉)
         #         2) 推理时当场用整夜数据算 mean/std → 未来泄漏 + 训练-推理不一致

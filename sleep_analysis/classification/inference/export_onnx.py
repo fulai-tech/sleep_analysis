@@ -85,7 +85,7 @@ def main():
                 x = x.reshape(x.shape[0], x.shape[1], 1)
 
             # ✅2026-08-07 - rdwang: 与 model.py 同步 — 去掉内部 per-batch 归一化
-            # (方案 A: 只保留外部 scaler, 在 Python 侧应用; 归一化不进入 ONNX 图)
+            # (外部 scaler 作为唯一归一化, 在 Python 侧应用; 归一化不进入 ONNX 图)
             # mean_x = x.mean(dim=(0, 1), keepdim=True)
             # std_x = x.std(dim=(0, 1), keepdim=True) + 1e-5
             # x = (x - mean_x) / std_x

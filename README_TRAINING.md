@@ -29,21 +29,48 @@ export PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring
 
 ## 数据预处理
 
-训练前必须完成 MESA 数据预处理。小规模试跑：
+训练前必须完成数据预处理。处理模式由环境变量 `SLEEP_CAUSAL` 控制：
+
+- 不设置（默认）：原版处理（复现作者/论文结果，特征含未来信息）
+- `SLEEP_CAUSAL=1`：**因果处理**（实时睡眠分期用，所有处理只使用已见数据）
+
+⚠️ 训练实时模型必须用 `SLEEP_CAUSAL=1` 生成的数据。两种模式产出的特征不同，不能混用。
+
+### MESA
 
 ```bash
 cd third_party/sleep_analysis
-PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring \
-python experiments/data_handling/preprocess_subset.py 50   # 50 个被试，约 750 MB
+
+# 小规模试跑 (2 个被试)
+SLEEP_CAUSAL=1 \
+python experiments/data_handling/preprocess_subset.py 2 --no-edr --n-workers 4 \
+    --output-dir /srv/shared/psgdata/xxx/mesa_processed
+
+# 全量 (因果模式 + 屏蔽 EDR + 10 worker 并行)
+SLEEP_CAUSAL=1 \
+python experiments/data_handling/preprocess_subset.py 2056 --no-edr --n-workers 10 \
+    --output-dir /srv/shared/psgdata/xxx/mesa_processed
 ```
 
-全量处理：
+### SHHS1 / SHHS2
 
 ```bash
-python experiments/data_handling/preprocess_subset.py 2056   # 全量，约 15-20 GB
+SLEEP_CAUSAL=1 \
+python experiments/data_handling/preprocess_shhs.py --study shhs1 --n-subjects 99999 --no-edr --n-workers 10 \
+    --output-dir /srv/shared/psgdata/xxx/shhs1_processed
+# shhs2 同理 (--study shhs2)
 ```
 
-预处理产出目录在 `study_data.json` 中配置（`processed_mesa_path` 字段）。
+### 参数说明
+
+- `SLEEP_CAUSAL=1`：因果处理（RRV 信号因果滤波/降采样 + 左对齐回顾窗口）
+- `--no-edr`：屏蔽 EDR 特征提取（EDR 已弃用，占位全 0，节省计算）
+- `--output-dir`：输出目录（默认 study_data.json 配置的路径）
+- `--n-workers`：并行 worker 数
+
+⚠️ **换模式必须用新的 `--output-dir`**：输出目录有 run_config.json 模式锁（`check_run_mode`），跨模式续跑会被拒绝，防止静默复用旧模式的文件。
+
+预处理产出目录在 `study_data.json` 中配置（`processed_mesa_path` / `shhs1_processed_path` / `shhs2_processed_path`）。
 
 ---
 
@@ -59,17 +86,53 @@ sleep_analysis/classification/algorithm_scripts/LSTM_paper_params.py
 
 | 参数 | 数据集 | 体动 | 可用模态 | 预处理脚本 |
 |---|---|---|---|---|
-| `-d MESA_Sleep` | MESA | 有 | ACT+HRV+RRV(+EDR) | `preprocess_subset.py` |
-| `-d SHHS1` | SHHS1 | 无 | HRV+RRV+EDR | `preprocess_shhs.py --study shhs1` |
-| `-d SHHS2` | SHHS2 | 无 | HRV+RRV+EDR | `preprocess_shhs.py --study shhs2` |
+| `-d MESA_Sleep` | MESA | 有 | ACT+HRV+RRV | `preprocess_subset.py` |
+| `-d SHHS1` | SHHS1 | 无 | HRV+RRV | `preprocess_shhs.py --study shhs1` |
+| `-d SHHS2` | SHHS2 | 无 | HRV+RRV | `preprocess_shhs.py --study shhs2` |
+| `-d MESA_Sleep+SHHS1+SHHS2` | 混合 | 部分 | HRV+RRV | 上述预处理分别完成后 |
 
-不指定 `-d` 时默认为 `MESA_Sleep`。SHHS 数据集不指定 `--modality` 时自动使用 `HRV RRV EDR`。如果误传 `--modality ACT` 到 SHHS，脚本会打印警告并自动移除。
+不指定 `-d` 时默认为 `MESA_Sleep`。SHHS / 混合数据集不指定 `--modality` 时自动使用 `HRV RRV`（无体动数据）。如果误传 `--modality ACT` 到 SHHS，脚本会打印警告并自动移除。
+
+EDR 已弃用（2026-08 起），不再参与训练。
 
 所有参数通过命令行传入，**不需要修改脚本**。查看完整参数列表：
 
 ```bash
 python LSTM_paper_params.py --help
 ```
+
+### 实时模型训练（--causal）
+
+实时睡眠分期要求特征数据和模型窗口都是因果的（只用已见数据）。训练实时模型：
+
+```bash
+python LSTM_paper_params.py \
+  -d MESA_Sleep -c 4stage --causal \
+  --modality ACT HRV RRV \
+  --seq-len 21 --hidden 556 --layers 6 \
+  --dropout 0.255 --lr 6.31e-5 --batch-size 512 \
+  --split-file splits/split_mesa_1121_20260806.json
+```
+
+- `--causal`：序列窗口仅左侧 padding（窗口覆盖 [t-20, t]，不含未来）。config.json 记录 `causal=true`，推理引擎自动对齐
+- 论文参数（无 `--causal`）为 centered 窗口（含未来 5 分钟），仅用于复现/消融对比
+
+### 数据划分（--split-file）
+
+训练/验证/测试按被试级别划分。为跨实验一致性，可用固定 split 名单：
+
+```bash
+# MESA 单独训练
+--split-file splits/split_mesa_1121_20260806.json
+
+# 混合训练 (MESA+SHHS1+SHHS2)
+--split-file splits/split_mixed_20260808.json
+```
+
+- 单数据集格式：`{"train": [...], "val": [...], "test": [...]}`
+- 多数据集格式（混合训练）：`{"mesasleep": {...}, "shhs1": {...}, "shhs2": {...}}`，按数据集前缀匹配各自名单
+- SHHS1/2 的划分按 nsrrid 联合生成（同一参与者不会跨 train/val/test），由 `experiments/data_handling/make_splits.py` 生成
+- 不传 `--split-file` 时用代码内自动划分（80/20 → 80/20）
 
 ### 论文参数复现
 
@@ -122,14 +185,12 @@ python LSTM_paper_params.py -c 4stage
 
 ### 模态选择
 
-论文 5-class Baseline 使用 `ACT + HRV + RRV`。`EDR` 是可选扩展。
-
 | 参数 | 特征 | 维度 | 来源 |
 |---|---|---|---|
 | `ACT` | 体动均值 | 1 | 腕动计 |
 | `HRV` | 心率变异性（时域+频域+非线性） | 8 | ECG R-point |
-| `RRV` | 呼吸率变异性（5/9 min 窗口） | 4 | 胸腔呼吸带 |
-| `EDR` | ECG 衍生呼吸率变异性 | 4 | ECG 提取的呼吸信号 |
+| `RRV` | 呼吸率变异性（150/270s 回顾窗口） | 4 | 胸腔呼吸带 |
+| ~~`EDR`~~ | ~~ECG 衍生呼吸率变异性~~ | ~~4~~ | ~~已弃用 (2026-08)~~ |
 
 ### 快速验证
 
@@ -159,7 +220,7 @@ LOG_FILE="exports_our/train_5stage_$(date +%Y-%m-%d_%H%M%S).log"
 
 PYTHON_KEYRING_BACKEND=keyring.backends.null.Keyring \
 python -u sleep_analysis/classification/algorithm_scripts/LSTM_paper_params.py \
-  -c 5stage --modality ACT HRV RRV \
+  -c 5stage --modality ACT HRV RRV --causal \
   --seq-len 21 --hidden 556 --layers 6 --dropout 0.255 --lr 6.31e-5 \
   2>&1 | tee "$LOG_FILE"
 
@@ -174,9 +235,11 @@ python -u sleep_analysis/classification/algorithm_scripts/LSTM_paper_params.py \
 
 ```
 exports_our/2026-07-16_193807/
-├── config.json              # 训练参数（自文档化）
+├── config.json              # 训练参数（自文档化，含 causal 标志）
+├── study_data.json          # 训练时的数据路径快照（数据来源可追溯）
 ├── checkpoints/
 │   ├── best_model.pt        # 最佳模型（验证 loss 最低）
+│   ├── scaler.json          # 外部归一化参数（训练集拟合，推理必需）
 │   ├── ckpt_epoch_005_acc0.5234_k0.4521_mcc0.4703.pt
 │   └── ...                  # 每 5 epoch 存一个
 ├── per_subject_predictions/ # 每个被试逐 epoch 预测
@@ -189,6 +252,8 @@ exports_our/2026-07-16_193807/
     ├── results.json                      # 所有指标汇总
     └── predictions.pickle
 ```
+
+`study_data.json` 是训练时的数据路径快照（`processed_mesa_path` / `shhs*_processed_path` 等）——训练代码会自动复制到产出目录，记录本次训练读取了哪份数据（训练后 study_data.json 路径再更改也不影响追溯）。
 
 ### 评估已有模型
 
@@ -204,7 +269,27 @@ python LSTM_paper_params.py \
   --eval-only --small
 ```
 
-`--load-weights` 会自动读取同次训练的 `config.json`，恢复 `hidden_size`、`num_layers`、`classification` 等全部超参数，无需手动指定。
+`--load-weights` 会自动读取同次训练的 `config.json`，恢复 `hidden_size`、`num_layers`、`classification`、`causal` 等全部超参数，无需手动指定。
+
+---
+
+## 推理引擎（新数据推理）
+
+训练好的模型可用于对新被试推理（特征 CSV → 预测）。引擎自动从 run 目录读取 config.json（causal 等）和 checkpoints/scaler.json（归一化），无需手动传参。
+
+```bash
+# 导出 ONNX（可选，部署用）
+python sleep_analysis/classification/inference/export_onnx.py \
+    --run-dir exports_our/<timestamp>
+
+# PyTorch 引擎推理
+python sleep_analysis/classification/inference/inference_features.py \
+    --run-dir exports_our/<timestamp> --subject <ID> --backend torch
+
+# ONNX 引擎推理
+python sleep_analysis/classification/inference/inference_features.py \
+    --run-dir exports_our/<timestamp> --subject <ID> --backend onnx
+```
 
 ---
 
@@ -255,15 +340,29 @@ rem      10.5   2.6   19.6   0.1   67.2
 
 ### 数据划分
 
-训练/验证/测试按被试级别划分（80%/ 20%→16%），确保同一被试的数据不会同时出现在训练集和验证/测试集中。
+训练/验证/测试按被试级别划分（80%/ 20%→16%），确保同一被试的数据不会同时出现在训练集和验证/测试集中。跨实验一致性用 `--split-file` 固定名单（见上文）。
 
 ### 实时分期
 
-当前模型使用 centered sliding window（窗口包含未来数据），不适合实时分期。如需实时，修改 `data_peparation.py` 的 padding 为仅左侧。
+实时睡眠分期已支持（2026-08 完成改造）。**实时可用模型需同时满足两个开关**：
 
-### 已知问题
+1. **数据因果**（`SLEEP_CAUSAL=1` 生成特征，记录在输出目录 run_config.json）：
+   - RRV 信号滤波/降采样：filtfilt（零相位双向）→ lfilter（因果正向）
+   - RRV 窗口：伪居中（含未来 1-2 分钟）→ 左对齐回顾窗口（epoch j 只依赖 [j-W+1, j] 的已见数据）
+   - EDR 已弃用（`--no-edr`）
+   - 已知保留项（团队决策）：HRV 处理（process_rpoint）与 R 点检测保持原版——HRV 特征实测差异中位 0%，保持与原版模型可比性；causal 实现在代码中注释保留（`rr_utils.py` / `ecg_rpeaks.py`）
+2. **模型因果**（`--causal` 训练，config.json 的 `causal=true`）：
+   - 序列窗口仅左侧 padding（不含未来）
+   - 已移除模型内部整夜归一化（只保留训练集 scaler——训练/推理一致、无未来依赖、逐窗口推理可行）
+   - 序列 padding 用首值填充（原为整夜均值，含未来）
 
-- `ecg.py`: 修复了新版 pandas `value_counts().reset_index()` 列名兼容
+两个开关相互独立：`SLEEP_CAUSAL` 控制数据生成（预处理阶段），config.json 的 `causal` 控制模型窗口（训练/推理阶段）。详见 `sleep_analysis/processing_config.py` 顶部说明。
+
+### 已知问题 / 决策记录
+
+- `rrv.py`: RRV 因果改造（滤波 + 左对齐窗口），causal 分支由 `SLEEP_CAUSAL` 控制
+- `rr_utils.py`: process_rpoint 已抽为 MESA/SHHS 共用；causal 实现注释保留（HRV 决策：保持原版可比性）
+- `ecg.py`: 转发 `rr_utils.process_rpoint`
+- `model.py`: 已移除内部 per-batch 归一化（外部 scaler 作为唯一归一化，注释保留可回退）；正交初始化在 CPU 上执行以兼容 CUDA
+- `LSTM_paper_params.py`: `--split-file` 支持单数据集/多数据集（混合训练）两种格式
 - `hrv.py`, `rrv.py`: 修复了 `Path(__file__).parents[N]` 层级错误
-- `model.py`: 正交初始化在 CPU 上执行以兼容 CUDA 13.0
-- `LSTM.py` (line 354): 修了变量名 `mean_performance` → `mean_mcc`
