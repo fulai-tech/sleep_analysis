@@ -308,32 +308,90 @@ if args.split_file is not None:
     # 20260806: 按名单划分 (--split-file) — 用固定的 train/val/test ID 列表,
     # 保证跨数据集/跨实验划分一致 (train_test_split 的 shuffle 依赖被试总数,
     # 1121 vs 1120 会把整个划分打乱, 两次实验无法严格对比)
-    if not _singleton:
-        raise ValueError("--split-file 目前仅支持单数据集 (MESA_Sleep / SHHS1 / SHHS2)")
+    # 2026-08-07: 支持多数据集格式 (混合训练 MESA+SHHS1+SHHS2):
+    #   {"mesasleep": {"train":[...], "val":[...], "test":[...]}, "shhs1": {...}, "shhs2": {...}}
+    #   MixedDataset 的 subj_id 带 "src@" 前缀 → 按前缀匹配各自数据集名单;
+    #   单数据集训练 (无前缀) → 遍历全部名单匹配 raw ID
     with open(args.split_file) as _f:
         _split = json.load(_f)
-    _want = {k: set(v) for k, v in _split.items()}
-    # subj_id 可能带 "source@" 前缀 (MixedDataset), 统一取 "@" 之后
-    _ids = [str(s).split("@")[-1] for s in dataset.index["subj_id"]]
-    _id_set = set(_ids)
-    train_set = dataset[[i for i, sid in enumerate(_ids) if sid in _want["train"]]]
-    val_set = dataset[[i for i, sid in enumerate(_ids) if sid in _want["val"]]]
-    test_set = dataset[[i for i, sid in enumerate(_ids) if sid in _want["test"]]]
+    _multi = all(isinstance(v, dict) and "train" in v for v in _split.values())
 
-    # 20260806: 数据与 split 名单一致性告警 (双向检查)
-    _in_split_not_data = sorted((_want["train"] | _want["val"] | _want["test"]) - _id_set)  # 名单有但数据无
-    _in_data_not_split = sorted(_id_set - (_want["train"] | _want["val"] | _want["test"]))  # 数据有但名单无
-    if _in_split_not_data or _in_data_not_split:
-        print("[WARNING] 数据与 split 名单不一致!")
-        if _in_split_not_data:
-            print(f"  [WARNING] 名单中有但数据缺失 {len(_in_split_not_data)} 个: {_in_split_not_data}")
-        if _in_data_not_split:
-            print(f"  [WARNING] 数据中有但名单缺失 {len(_in_data_not_split)} 个: {_in_data_not_split}")
-    for _k in ("train", "val", "test"):
-        _n_actual = len(locals()[f"{_k}_set"].index)
-        _n_want = len(_want[_k])
-        _flag = "  ← 不一致" if _n_actual != _n_want else ""
-        print(f"[SPLIT] {_k}: 名单 {_n_want} -> 实际 {_n_actual}{_flag}")
+    if _multi:
+        _want = {name: {k: set(v) for k, v in parts.items()} for name, parts in _split.items()}
+        if _singleton:
+            # 单数据集: subj_id 无前缀, 在所有数据集名单中匹配 raw ID
+            _all_parts = {k: set().union(*(_want[n][k] for n in _want)) for k in ("train", "val", "test")}
+            _ids = [str(s) for s in dataset.index["subj_id"]]
+            train_set = dataset[[i for i, sid in enumerate(_ids) if sid in _all_parts["train"]]]
+            val_set = dataset[[i for i, sid in enumerate(_ids) if sid in _all_parts["val"]]]
+            test_set = dataset[[i for i, sid in enumerate(_ids) if sid in _all_parts["test"]]]
+        else:
+            # 混合数据集: 按 src 前缀 (与 MixedDataset 的 subj_id 前缀一致) 匹配各自名单
+            _src_name_map = {name.lower().replace("_", ""): name for name in DATASET_PARTS}
+            _train_sources, _val_sources, _test_sources = {}, {}, {}
+            for _src_key, _parts in _want.items():
+                if _src_key not in _src_name_map:
+                    print(f"[WARNING] split 名单中的数据集 {_src_key} 不在本次训练数据集内, 跳过")
+                    continue
+                ds = _DS_REGISTRY[_src_name_map[_src_key]]()
+                _ids = [str(s) for s in ds.index["subj_id"]]
+                _tr = [i for i, sid in enumerate(_ids) if sid in _parts["train"]]
+                _va = [i for i, sid in enumerate(_ids) if sid in _parts["val"]]
+                _te = [i for i, sid in enumerate(_ids) if sid in _parts["test"]]
+                _train_sources[_src_key] = ds[_tr] if _tr else ds[0:0]
+                _val_sources[_src_key] = ds[_va] if _va else ds[0:0]
+                _test_sources[_src_key] = ds[_te] if _te else ds[0:0]
+            train_set = MixedDataset(_train_sources)
+            val_set = MixedDataset(_val_sources)
+            test_set = MixedDataset(_test_sources)
+            dataset = train_set  # 兼容后续打印 (L395 用 len(dataset), 与原自动划分分支一致)
+
+        # 数据与 split 名单一致性告警 (总集合层面: 全部数据集的 ID, 而非仅 train)
+        _all_want = {raw for parts in _want.values() for k in parts for raw in parts[k]}
+        if _singleton:
+            _all_data = {str(s).split("@")[-1] for s in dataset.index["subj_id"]}
+        else:
+            _all_data = set()
+            for _sources in (_train_sources, _val_sources, _test_sources):
+                for _src_ds in _sources.values():
+                    _all_data |= {str(s).split("@")[-1] for s in _src_ds.index["subj_id"]}
+        _in_split_not_data = sorted(_all_want - _all_data)
+        _in_data_not_split = sorted(_all_data - _all_want)
+        if _in_split_not_data or _in_data_not_split:
+            print("[WARNING] 数据与 split 名单不一致!")
+            if _in_split_not_data:
+                print(f"  [WARNING] 名单中有但数据缺失 {len(_in_split_not_data)} 个: {_in_split_not_data[:10]}")
+            if _in_data_not_split:
+                print(f"  [WARNING] 数据中有但名单缺失 {len(_in_data_not_split)} 个: {_in_data_not_split[:10]}")
+        for _k in ("train", "val", "test"):
+            _n_actual = len(locals()[f"{_k}_set"].index)
+            _n_want = sum(len(_want[n][_k]) for n in _want)
+            _flag = "  ← 不一致" if _n_actual != _n_want else ""
+            print(f"[SPLIT] {_k}: 名单 {_n_want} -> 实际 {_n_actual}{_flag}")
+    else:
+        # 单数据集格式 (旧): {"train": [...], "val": [...], "test": [...]}
+        _want = {k: set(v) for k, v in _split.items()}
+        # subj_id 可能带 "source@" 前缀 (MixedDataset), 统一取 "@" 之后
+        _ids = [str(s).split("@")[-1] for s in dataset.index["subj_id"]]
+        _id_set = set(_ids)
+        train_set = dataset[[i for i, sid in enumerate(_ids) if sid in _want["train"]]]
+        val_set = dataset[[i for i, sid in enumerate(_ids) if sid in _want["val"]]]
+        test_set = dataset[[i for i, sid in enumerate(_ids) if sid in _want["test"]]]
+
+        # 20260806: 数据与 split 名单一致性告警 (双向检查)
+        _in_split_not_data = sorted((_want["train"] | _want["val"] | _want["test"]) - _id_set)  # 名单有但数据无
+        _in_data_not_split = sorted(_id_set - (_want["train"] | _want["val"] | _want["test"]))  # 数据有但名单无
+        if _in_split_not_data or _in_data_not_split:
+            print("[WARNING] 数据与 split 名单不一致!")
+            if _in_split_not_data:
+                print(f"  [WARNING] 名单中有但数据缺失 {len(_in_split_not_data)} 个: {_in_split_not_data}")
+            if _in_data_not_split:
+                print(f"  [WARNING] 数据中有但名单缺失 {len(_in_data_not_split)} 个: {_in_data_not_split}")
+        for _k in ("train", "val", "test"):
+            _n_actual = len(locals()[f"{_k}_set"].index)
+            _n_want = len(_want[_k])
+            _flag = "  ← 不一致" if _n_actual != _n_want else ""
+            print(f"[SPLIT] {_k}: 名单 {_n_want} -> 实际 {_n_actual}{_flag}")
 elif _singleton:
     train_set, test_set = get_random_split(dataset=dataset)
     train_set, val_set = get_random_split(dataset=train_set)
