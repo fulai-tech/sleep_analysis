@@ -55,8 +55,11 @@ class OnnxInferenceEngine:
         self.modality = self.config["modality"]
         self.num_classes = get_num_classes(self.classification_type)
         self.input_size = get_num_input(self.modality)
+        self.hidden_size = self.config["hidden_size"]
+        self.num_layers = self.config["num_layers"]
         self.seq_len = self.config.get("seq_len", 21)
         self.causal = self.config.get("causal", False)  # 注意: 只控制序列 padding 方向, 与 processing_config.causal (数据生成) 无关
+        self.stateful = self.config.get("stateful", False)  # ✅2026-08-11: 有状态推理 (逐帧扫描)
 
         # 加载第一层 scaler
         self.scaler_mean, self.scaler_scale = load_scaler(self.run_dir)
@@ -72,8 +75,10 @@ class OnnxInferenceEngine:
             str(onnx_path),
             providers=["CPUExecutionProvider"],
         )
-        self.input_name = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
+        # ✅2026-08-11: 用名字映射而非 [0] 索引 — stateful 图有 4 输入 (x,h,c,buf) / 4 输出
+        # (logits,h_n,c_n,buf_out); 无状态图仍是 "input"/"output", 行为不变
+        self.input_names = [i.name for i in self.session.get_inputs()]
+        self.output_names = [o.name for o in self.session.get_outputs()]
 
         print(f"[OnnxEngine] Loaded model from {self.run_dir}")
         print(f"  classification: {self.classification_type}")
@@ -139,17 +144,39 @@ class OnnxInferenceEngine:
         print(f"  {label}: {n_epochs} epochs, "
               f"{features.shape[1]} features")
 
-        # ---- 3. 构建滑动窗口 ----
-        x = build_sequences(features, seq_len=self.seq_len, causal=self.causal)
+        # ---- 3. 构建滑动窗口 / stateful 逐帧扫描 ----
+        if self.stateful:
+            # ✅2026-08-11: stateful — 逐帧 session.run, 状态 (h,c,buf) 由引擎维护
+            x = apply_scaler(features, self.scaler_mean, self.scaler_scale)  # (n, F)
+            h = np.zeros((self.num_layers, 1, self.hidden_size), dtype=np.float32)
+            c = np.zeros((self.num_layers, 1, self.hidden_size), dtype=np.float32)
+            buf = np.zeros((1, self.seq_len - 1, self.hidden_size), dtype=np.float32)
+            # warm-up: 首帧 seq_len-1 次 (与训练一致)
+            for _ in range(self.seq_len - 1):
+                _, h, c, buf = self.session.run(
+                    self.output_names,
+                    {"x": x[0:1], "h": h, "c": c, "buf": buf},
+                )
+            logits_list = []
+            for t in range(n_epochs):
+                out, h, c, buf = self.session.run(
+                    self.output_names,
+                    {"x": x[t:t + 1], "h": h, "c": c, "buf": buf},
+                )
+                logits_list.append(out[0])
+            onnx_out = np.stack(logits_list)  # (n, num_classes)
+        else:
+            # ---- 3. 构建滑动窗口 ----
+            x = build_sequences(features, seq_len=self.seq_len, causal=self.causal)
 
-        # ---- 4. 第一层标准化 ----
-        x = apply_scaler(x, self.scaler_mean, self.scaler_scale)
+            # ---- 4. 第一层标准化 ----
+            x = apply_scaler(x, self.scaler_mean, self.scaler_scale)
 
-        # ---- 5. ONNX 推理 ----
-        onnx_out = self.session.run(
-            [self.output_name],
-            {self.input_name: x},
-        )[0]  # shape: (n_epochs, num_classes)
+            # ---- 5. ONNX 推理 ----
+            onnx_out = self.session.run(
+                [self.output_names[0]],
+                {self.input_names[0]: x},
+            )[0]  # shape: (n_epochs, num_classes)
 
         # ---- 6. 解码预测 ----
         if self.classification_type == "binary":

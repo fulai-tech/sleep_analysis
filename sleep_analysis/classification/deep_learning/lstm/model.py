@@ -33,7 +33,7 @@ class Attention(nn.Module):
 class Model(nn.Module):
     def __init__(
         self, num_classes, input_size, hidden_size, num_layers, dropout, use_gpu, use_attention=True,
-        dataset_name="dataset_name", modality="acc"
+        dataset_name="dataset_name", modality="acc", use_internal_norm=False
     ):
         super(Model, self).__init__()
         torch.manual_seed(42)
@@ -53,6 +53,7 @@ class Model(nn.Module):
         self.dataset_name = dataset_name
         self.use_attention = use_attention
         self.use_gpu = use_gpu
+        self.use_internal_norm = use_internal_norm  # ✅2026-08-14: 旧版内部归一化开关 (复现 08-06 基线用)
 
         self.lstm = nn.LSTM(input_size=input_size, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
 
@@ -113,19 +114,22 @@ class Model(nn.Module):
         #             (训练=batch混合统计 vs 推理=整夜统计)
         #         3) 去掉后 forward 不依赖 batch 统计 → 整夜 batch 与逐窗口/流式推理
         #             结果完全一致, 是实时推理的前提; ONNX 图也更干净
-        #   回退: 取消下方注释即可
 
-        #  历史: 
-        # ✅20260803 - rdwang: 推理pipeline误差可能是1e-8导致的。AI分析: ONNX 的算子实现和 PyTorch 不同——torch.std(unbiased=True) 在 ONNX 里没有对等算子，dynamo 只能用 ReduceMean（总体方差，除以 n）来近似，在 Feature 1 std≈0 时被 eps=1e-8 放大。
-        # ✅20260804 - rdwang: 提到1e-5之后问题解决。
-        
-        # mean_x = x.mean(dim=(0, 1), keepdim=True)
-        # std_x = x.std(dim=(0, 1), keepdim=True) + 1e-5  # Avoid division by zero
-        # if torch.isnan(mean_x).any() or torch.isnan(std_x).any():
-        #     print("[DEBUG] Skipping normalization due to NaN in batch statistics")
-        # else:
-        #     x = (x - mean_x) / std_x
-        # debug_tensor(x, "Normalized Input x")
+        # ✅2026-08-14 - rdwang: 为复现 08-06 基线 (MCC 0.564), 把旧版内部归一化做成
+        #   --internal-norm 开关 (默认关闭, 行为与 08-07 之后完全一致)。
+        #   恢复的代码取自 git 37a1618^ (remove additional normalization 的父版本), 一字不差。
+        #   注意: 该路径重新引入 训练=batch统计 vs 推理=整夜统计 的不一致, 仅用于复现对照。
+        if self.use_internal_norm:
+            #  历史:
+            # ✅20260803 - rdwang: 推理pipeline误差可能是1e-8导致的。AI分析: ONNX 的算子实现和 PyTorch 不同——torch.std(unbiased=True) 在 ONNX 里没有对等算子，dynamo 只能用 ReduceMean（总体方差，除以 n）来近似，在 Feature 1 std≈0 时被 eps=1e-8 放大。
+            # ✅20260804 - rdwang: 提到1e-5之后问题解决。
+            mean_x = x.mean(dim=(0, 1), keepdim=True)
+            std_x = x.std(dim=(0, 1), keepdim=True) + 1e-5  # Avoid division by zero
+            if torch.isnan(mean_x).any() or torch.isnan(std_x).any():
+                print("[DEBUG] Skipping normalization due to NaN in batch statistics")
+            else:
+                x = (x - mean_x) / std_x
+            debug_tensor(x, "Normalized Input x")
 
         # Initialize hidden and cell state
         if self.use_gpu:
@@ -160,3 +164,53 @@ class Model(nn.Module):
         debug_tensor(out, "Final Model Output")
 
         return out
+
+    def forward_stateful(self, x_t, h, c, buf):
+        """Stateful 单帧前向 (流式分期核心)。
+
+        :param x_t: 单帧特征, (B, F) 或 (B, 1, F)  (注意: 与 forward() 的 (B, F, 1) 不同)
+        :param h:   隐状态 (num_layers, B, hidden_size)
+        :param c:   细胞状态 (num_layers, B, hidden_size)
+        :param buf: 最近 (seq_len-1) 个时刻的顶层 h, (B, seq_len-1, hidden_size)
+        :return:    (logits (B, num_classes), h_n, c_n, buf_out (B, seq_len-1, hidden_size))
+
+        ✅2026-08-11 - rdwang: 有状态训练/推理的单帧步进。与 forward() 的滑窗语义逐位对齐:
+          每夜先对首帧 warm-up (seq_len-1) 次 (由调用方完成), 之后第 t 帧的 logits =
+          MLP(mean(h_{t-seq_len+1..t})) —— 等价于无状态窗口 [t-seq_len+1..t] 的池化
+          (epoch 0 逐位一致; epoch >= 1 额外携带前缀上下文, 是状态化的目的)。
+          ⚠️ 池化必须取 (buf, h_n) 共 seq_len 个值, 不能取 buf_out (seq_len-1 个, 差一)。
+          状态全部显式传递, 无隐藏 module 状态 → 可 ONNX 导出。
+        ✅2026-08-13 - rdwang: 严禁在此调用 self.to(device) — 每帧触发 nn.LSTM._apply →
+          重建扁平化权重缓冲 (~55 MB), 且 cuDNN autograd 节点把它保存到 chunk backward,
+          逐帧堆积 (21 warm-up + 64 chunk ≈ 4.7 GB) 直接 OOM (MESA stateful 实测)。
+          模型在构造 (Model.__init__ use_gpu) / 加载权重 (engine _load_weights, test cuda())
+          时已在目标设备上, 运行中设备不变, 无需每步迁移。
+        """
+        # (B, F) → (B, 1, F): 帧输入的特征轴在 dim 1, 与 forward() 的 (B, F, 1) reshape 不同
+        if len(x_t.shape) == 2:
+            x_t = x_t.unsqueeze(1)
+
+        if torch.isnan(x_t).any():
+            # 镜像 forward():101-103 的 NaN 逃逸: logits 置零, 状态不推进 (数据错误, 帧对齐保持)
+            print("[DEBUG] NaN detected in stateful input. Returning zero logits without advancing state.")
+            return torch.zeros(x_t.shape[0], self.num_classes, device=x_t.device), h, c, buf
+
+        lstm_out, (h_n, c_n) = self.lstm(x_t, (h, c))  # lstm_out: (B, 1, H)
+
+        # 顶层隐状态 (与 forward() 的 lstm_out 取同一层)
+        last_h = h_n[-1]  # (B, H)
+
+        # 池化: 必须取 (buf, h_n) 共 seq_len 个值 (buf: 最近 S-1 个 + 当前 1 个)
+        combined = torch.cat([buf, last_h.unsqueeze(1)], dim=1)  # (B, seq_len, H)
+        pooled = combined.mean(dim=1)  # 与 forward() 的 lstm_out.mean(dim=1) 一致
+
+        out = self.relu(pooled)
+        out = self.fc_1(out)
+        out = self.dropout(out)
+        out = self.relu(out)
+        out = self.fc(out)
+
+        # 滚动缓冲: 丢掉最旧的, 推入当前
+        buf_out = torch.cat([buf[:, 1:, :], last_h.unsqueeze(1)], dim=1)  # (B, seq_len-1, H)
+
+        return out, h_n, c_n, buf_out

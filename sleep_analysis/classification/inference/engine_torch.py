@@ -62,6 +62,7 @@ class TorchInferenceEngine:
         self.dropout = self.config["dropout"]
         self.seq_len = self.config.get("seq_len", 21)
         self.causal = self.config.get("causal", False)  # 注意: 只控制序列 padding 方向, 与 processing_config.causal (数据生成) 无关
+        self.stateful = self.config.get("stateful", False)  # ✅2026-08-11: 有状态推理 (逐帧扫描)
 
         # 设备
         if device == "auto":
@@ -104,6 +105,7 @@ class TorchInferenceEngine:
             use_attention=False,  # 训练/测试均未使用 attention，用 mean pooling
             dataset_name=self.config.get("dataset", ""),
             modality=self.modality,
+            use_internal_norm=self.config.get("internal_norm", False),  # ✅2026-08-14: 复现旧版基线
         )
         model.eval()
         return model
@@ -157,15 +159,32 @@ class TorchInferenceEngine:
         print(f"  {label}: {n_epochs} epochs, "
               f"{features.shape[1]} features")
 
-        # ---- 3. 构建滑动窗口 ----
-        x = build_sequences(features, seq_len=self.seq_len, causal=self.causal)
+        # ---- 3. 构建滑动窗口 / stateful 逐帧扫描 ----
+        if self.stateful:
+            # ✅2026-08-11: stateful — 逐帧扫描 (每帧 O(1), 无滑窗重算, 上下文不受 seq_len 限制)
+            x = apply_scaler(features, self.scaler_mean, self.scaler_scale)  # (n, F)
+            x_tensor = torch.from_numpy(x).float().to(self.device)
+            h = torch.zeros(self.num_layers, 1, self.hidden_size, device=self.device)
+            c = torch.zeros(self.num_layers, 1, self.hidden_size, device=self.device)
+            buf = torch.zeros(1, self.seq_len - 1, self.hidden_size, device=self.device)
+            # warm-up: 首帧 seq_len-1 次 (与训练一致, 填充池化缓冲)
+            x0 = x_tensor[:1]
+            for _ in range(self.seq_len - 1):
+                _, h, c, buf = self.model.forward_stateful(x0, h, c, buf)
+            logits_list = []
+            for t in range(n_epochs):
+                out, h, c, buf = self.model.forward_stateful(x_tensor[t:t + 1], h, c, buf)
+                logits_list.append(out)
+            output = torch.cat(logits_list)  # (n, num_classes)
+        else:
+            x = build_sequences(features, seq_len=self.seq_len, causal=self.causal)
 
-        # ---- 4. 第一层标准化 (训练集拟合的 scaler) ----
-        x = apply_scaler(x, self.scaler_mean, self.scaler_scale)
+            # ---- 4. 第一层标准化 (训练集拟合的 scaler) ----
+            x = apply_scaler(x, self.scaler_mean, self.scaler_scale)
 
-        # ---- 5. 转为 tensor 并推理 ----
-        x_tensor = torch.from_numpy(x).float().to(self.device)
-        output = self.model(x_tensor)  # shape: (n_epochs, num_classes)
+            # ---- 5. 转为 tensor 并推理 ----
+            x_tensor = torch.from_numpy(x).float().to(self.device)
+            output = self.model(x_tensor)  # shape: (n_epochs, num_classes)
 
         # ---- 6. 解码预测 ----
         if self.classification_type == "binary":

@@ -109,7 +109,7 @@ def objective(trial):
 
     # 构建数据（seq_len 不同需要重建）
     data_loader = DataPreparation(seq_len=seq_len, overlap=None)
-    x_train, y_train, x_val, y_val, _, _ = data_loader.get_final_tensors(
+    x_train, y_train, x_val, y_val, _, _, _ = data_loader.get_final_tensors(
         args.modality, train_set, val_set, test_set[:4], args.classification
     )
 

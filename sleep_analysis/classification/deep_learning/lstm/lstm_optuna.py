@@ -53,7 +53,7 @@ class LSTM_Optuna:
         # load data in the respective format using custom dataloader
         print("load data...")
         data_loader = DataPreparation(seq_len=self.seq_len, overlap=None)
-        x_train, y_train, x_val, y_val, x_test, y_test = data_loader.get_final_tensors(
+        x_train, y_train, x_val, y_val, x_test, y_test, _ = data_loader.get_final_tensors(
             self.modality, train_set, val_set, test_set, self.classification_type
         )
 

@@ -60,6 +60,8 @@ def main():
     hidden_size = config["hidden_size"]
     num_layers = config["num_layers"]
     dropout = config["dropout"]
+    stateful = config.get("stateful", False)  # ✅2026-08-11: 有状态模型导出单步 scan 图
+    internal_norm = config.get("internal_norm", False)  # ✅2026-08-14: 旧版内部归一化 (复现基线)
 
     # 2. 计算 input_size
     from sleep_analysis.classification.deep_learning.utils import get_num_input, get_num_classes
@@ -71,6 +73,7 @@ def main():
     print(f"  modality: {modality}")
     print(f"  input_size: {input_size}, hidden: {hidden_size}, layers: {num_layers}")
     print(f"  seq_len: {seq_len}, num_classes: {num_classes}")
+    print(f"  stateful: {stateful}")
 
     # 3. 构建模型并加载权重
     from sleep_analysis.classification.deep_learning.lstm.model import Model
@@ -86,9 +89,11 @@ def main():
 
             # ✅2026-08-07 - rdwang: 与 model.py 同步 — 去掉内部 per-batch 归一化
             # (外部 scaler 作为唯一归一化, 在 Python 侧应用; 归一化不进入 ONNX 图)
-            # mean_x = x.mean(dim=(0, 1), keepdim=True)
-            # std_x = x.std(dim=(0, 1), keepdim=True) + 1e-5
-            # x = (x - mean_x) / std_x
+            # ✅2026-08-14: --internal-norm 时按旧版行为把归一化重新放进图 (复现 08-06 基线)
+            if self.use_internal_norm:
+                mean_x = x.mean(dim=(0, 1), keepdim=True)
+                std_x = x.std(dim=(0, 1), keepdim=True) + 1e-5  # Avoid division by zero
+                x = (x - mean_x) / std_x
 
             h_0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device)
             c_0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device)
@@ -107,17 +112,51 @@ def main():
             out = self.fc(out)
             return out
 
-    model = _ExportModel(
-        num_classes=num_classes,
-        input_size=input_size,
-        hidden_size=hidden_size,
-        num_layers=num_layers,
-        dropout=dropout,
-        use_gpu=False,
-        use_attention=False,
-        dataset_name=config.get("dataset", ""),
-        modality=modality,
-    )
+    # ✅2026-08-11: stateful 导出 — 单步 scan 图: (x, h, c, buf) → (logits, h_n, c_n, buf_out)
+    #   x:(B,F), h/c:(L,B,H), buf:(B,S-1,H) [batch-first, 与 engine 约定一致]
+    #   池化取 (buf, h_n) 共 S 个值 (不能取 buf_out, 差一); 无 NaN 守卫 (数据错误属 Python/引擎侧)
+    #   buf 滚动 = 图内 Slice + Concat; 状态全部显式入图, 无隐藏 module 状态
+    class _StatefulExportModel(Model):
+        def forward(self, x, h, c, buf):
+            if len(x.shape) == 2:
+                x = x.unsqueeze(1)          # (B, F) → (B, 1, F)
+            lstm_out, (h_n, c_n) = self.lstm(x, (h, c))
+            last_h = h_n[-1]                                # 顶层 (B, H)
+            combined = torch.cat([buf, last_h.unsqueeze(1)], dim=1)    # (B, S, H)
+            pooled = combined.mean(dim=1)
+            out = self.relu(pooled)
+            out = self.fc_1(out)
+            out = self.dropout(out)
+            out = self.relu(out)
+            out = self.fc(out)
+            buf_out = torch.cat([buf[:, 1:, :], last_h.unsqueeze(1)], dim=1)  # (B, S-1, H)
+            return out, h_n, c_n, buf_out
+
+    if stateful:
+        model = _StatefulExportModel(
+            num_classes=num_classes,
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            use_gpu=False,
+            use_attention=False,
+            dataset_name=config.get("dataset", ""),
+            modality=modality,
+        )
+    else:
+        model = _ExportModel(
+            num_classes=num_classes,
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            dropout=dropout,
+            use_gpu=False,
+            use_attention=False,
+            dataset_name=config.get("dataset", ""),
+            modality=modality,
+            use_internal_norm=internal_norm,
+        )
     model.eval()
 
     weights_path = run_dir / "checkpoints" / "best_model.pt"
@@ -128,30 +167,63 @@ def main():
     print(f"  Weights loaded from: {weights_path}")
 
     # 4. 创建 dummy input
-    dummy_input = torch.randn(1, seq_len, input_size, dtype=torch.float32)
-    print(f"  Dummy input shape: {dummy_input.shape}")
+    if stateful:
+        dummy_input = (
+            torch.randn(1, input_size, dtype=torch.float32),
+            torch.zeros(num_layers, 1, hidden_size, dtype=torch.float32),
+            torch.zeros(num_layers, 1, hidden_size, dtype=torch.float32),
+            torch.zeros(1, seq_len - 1, hidden_size, dtype=torch.float32),
+        )
+        print(f"  Dummy inputs: x (1,{input_size}), h/c ({num_layers},1,{hidden_size}), buf (1,{seq_len - 1},{hidden_size})")
+    else:
+        dummy_input = torch.randn(1, seq_len, input_size, dtype=torch.float32)
+        print(f"  Dummy input shape: {dummy_input.shape}")
 
     # 5. 导出 ONNX
     output_path = Path(args.output) if args.output else run_dir / "checkpoints" / "model.onnx"
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # 动态 batch 维度，固定 seq_len 和 input_size
-    dynamic_axes = {
-        "input": {0: "batch_size"},
-        "output": {0: "batch_size"},
-    }
+    if stateful:
+        # 动态 batch 维度: x/buf 在 dim 0, h/c 在 dim 1 (batch-first 约定)
+        dynamic_axes = {
+            "x": {0: "batch_size"},
+            "h": {1: "batch_size"},
+            "c": {1: "batch_size"},
+            "buf": {0: "batch_size"},
+            "logits": {0: "batch_size"},
+            "h_n": {1: "batch_size"},
+            "c_n": {1: "batch_size"},
+            "buf_out": {0: "batch_size"},
+        }
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(output_path),
+            export_params=True,
+            opset_version=args.opset,
+            do_constant_folding=True,
+            input_names=["x", "h", "c", "buf"],
+            output_names=["logits", "h_n", "c_n", "buf_out"],
+            dynamic_axes=dynamic_axes,
+        )
+    else:
+        # 动态 batch 维度，固定 seq_len 和 input_size
+        dynamic_axes = {
+            "input": {0: "batch_size"},
+            "output": {0: "batch_size"},
+        }
 
-    torch.onnx.export(
-        model,
-        dummy_input,
-        str(output_path),
-        export_params=True,
-        opset_version=args.opset,
-        do_constant_folding=True,
-        input_names=["input"],
-        output_names=["output"],
-        dynamic_axes=dynamic_axes,
-    )
+        torch.onnx.export(
+            model,
+            dummy_input,
+            str(output_path),
+            export_params=True,
+            opset_version=args.opset,
+            do_constant_folding=True,
+            input_names=["input"],
+            output_names=["output"],
+            dynamic_axes=dynamic_axes,
+        )
 
     print(f"\n  ONNX model saved to: {output_path}")
 
@@ -174,17 +246,34 @@ def main():
     print(f"\n  Quick sanity check (ONNX vs PyTorch):")
     import onnxruntime as ort
 
-    # PyTorch 输出
-    with torch.no_grad():
-        torch_out = model(dummy_input).numpy()
-
-    # ONNX 输出
     session = ort.InferenceSession(str(output_path))
-    onnx_out = session.run(None, {"input": dummy_input.numpy()})[0]
+    if stateful:
+        # stateful: 比较全部 4 个输出
+        with torch.no_grad():
+            torch_outs = [t.numpy() for t in model(*dummy_input)]
+        feed = {
+            "x": dummy_input[0].numpy(),
+            "h": dummy_input[1].numpy(),
+            "c": dummy_input[2].numpy(),
+            "buf": dummy_input[3].numpy(),
+        }
+        onnx_outs = session.run(None, feed)
+        for i, (to, oo) in enumerate(zip(torch_outs, onnx_outs)):
+            d = np.max(np.abs(to - oo))
+            print(f"  output[{i}] max diff: {d:.6f}")
+        max_diff = max(np.max(np.abs(a - b)) for a, b in zip(torch_outs, onnx_outs))
+    else:
+        # PyTorch 输出
+        with torch.no_grad():
+            torch_out = model(dummy_input).numpy()
 
-    max_diff = np.max(np.abs(torch_out - onnx_out))
-    print(f"  PyTorch output: {torch_out.flatten()[:5]}...")
-    print(f"  ONNX output:    {onnx_out.flatten()[:5]}...")
+        # ONNX 输出
+        onnx_out = session.run(None, {"input": dummy_input.numpy()})[0]
+
+        max_diff = np.max(np.abs(torch_out - onnx_out))
+        print(f"  PyTorch output: {torch_out.flatten()[:5]}...")
+        print(f"  ONNX output:    {onnx_out.flatten()[:5]}...")
+
     print(f"  Max diff: {max_diff:.6f}")
     if max_diff < 1e-4:
         print(f"  ✓ Outputs match (max diff < 1e-4)")
@@ -199,7 +288,9 @@ def main():
         "source_weights": str(weights_path),
         "onnx_model": str(output_path),
         "opset": args.opset,
-        "input_shape": ["batch_size", seq_len, input_size],
+        "stateful": stateful,
+        "input_shape": (["batch_size", input_size] if stateful
+                        else ["batch_size", seq_len, input_size]),
         "output_shape": ["batch_size", num_classes],
         "classification_type": classification_type,
         "modality": modality,

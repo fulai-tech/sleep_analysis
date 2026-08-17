@@ -358,6 +358,28 @@ rem      10.5   2.6   19.6   0.1   67.2
 
 两个开关相互独立：`SLEEP_CAUSAL` 控制数据生成（预处理阶段），config.json 的 `causal` 控制模型窗口（训练/推理阶段）。详见 `sleep_analysis/processing_config.py` 顶部说明。
 
+#### stateful 模式（2026-08-11 新增）
+
+无状态滑窗推理每预测一帧要重算整个 seq_len 窗口（~21 倍冗余算力），且模型上下文被窗口长度限制。**stateful 模式**改为逐 epoch 扫描：
+
+- **训练**：`--stateful`（需与 `--causal` 一起，校验在 config restore 之后——`--load-weights <causal-run> --stateful` 可用）。逐帧携带 LSTM (h, c) 状态，用最近 seq_len 个 h 的滚动缓冲做均值池化；truncated BPTT 训练（`--state-chunk C`，默认 64 帧截断，detach 梯度；P = batch_size // C 个被试并行）
+- **推理**：每帧 O(1)（1 步 LSTM 展开 + 缓冲池化，无窗口重算），上下文不受 seq_len 限制；config.json 的 `stateful=true` 驱动两个推理引擎自动走扫描路径
+- **冷启动**：每夜开始前用首帧特征从零状态 warm-up seq_len-1 次填充缓冲——与无状态 edge-pad 语义一致（epoch 0 与无状态窗口逐位一致，epoch ≥ 1 额外携带前缀上下文，是状态化的目的）；训练/推理同一协议，无未来泄漏
+- **ONNX**：导出单步 scan 图（4 输入 `x,h,c,buf` → 4 输出 `logits,h_n,c_n,buf_out`，动态 batch），引擎逐帧 `session.run` 并维护状态
+- 无状态路径（默认）完全不变；旧模型与旧 ONNX 图继续可用
+
+```bash
+# 训练 stateful 模型
+python LSTM_paper_params.py -c 5stage --causal --stateful \
+  --seq-len 21 --hidden 556 --layers 6 --dropout 0.255 --lr 6.31e-5 \
+  --split-file splits/split_mesa_1121_20260806.json
+
+# 导出 stateful ONNX + 推理 (引擎自动按 config 走 stateful 路径)
+python sleep_analysis/classification/inference/export_onnx.py --run-dir exports_our/<timestamp>
+python sleep_analysis/classification/inference/inference_features.py \
+    --run-dir exports_our/<timestamp> --subject <ID> --backend torch|onnx
+```
+
 ### 已知问题 / 决策记录
 
 - `rrv.py`: RRV 因果改造（滤波 + 左对齐窗口），causal 分支由 `SLEEP_CAUSAL` 控制
@@ -366,3 +388,7 @@ rem      10.5   2.6   19.6   0.1   67.2
 - `model.py`: 已移除内部 per-batch 归一化（外部 scaler 作为唯一归一化，注释保留可回退）；正交初始化在 CPU 上执行以兼容 CUDA
 - `LSTM_paper_params.py`: `--split-file` 支持单数据集/多数据集（混合训练）两种格式
 - `hrv.py`, `rrv.py`: 修复了 `Path(__file__).parents[N]` 层级错误
+- `model.py`: 新增 `forward_stateful`（单帧步进，显式状态，可导出）；池化必须取 (buf, h_n) 共 seq_len 个值（buf_out 差一）
+- `data_peparation.py`: 特征选择抽为 `_extract_subj_features_raw`（get_data / get_frame_data 共用）；`get_frame_data` 复用窗口路径拟合的训练集 scaler（不可自拟合）
+- `LSTM.py`: stateful 分支（`_stateful_groups` / `_stateful_warmup` / `_stateful_build_chunk` / `_stateful_chunk_step` / `_stateful_scan`）
+- `engine_torch.py` / `engine_onnx.py`: 按 config `stateful` 分派扫描路径；ONNX 引擎改用输入/输出名映射（stateful 图 4 入 4 出）

@@ -112,6 +112,65 @@ class DataPreparation:
 
         return x_normalized, scaler
 
+    def _extract_subj_features_raw(self, subj, dataset_cls_name, modality, classification_type="binary"):
+        """按 modality 选择特征列并返回 (features_df, ground_truth_df)。
+
+        ✅2026-08-11 - rdwang: 从 get_data 闭包中抽出, 供 get_data (窗口) 与
+        get_frame_data (stateful 帧) 共用, 保证两路径特征选择完全一致。
+        :param dataset_cls_name: 数据集类名 (dataset.__class__.__name__), 与原闭包
+            的检查对象一致 (MixedDataset 元素类名可能不同于 dataset 类名, 不能改用 subj)。
+        """
+        features = pd.DataFrame()
+        all_features = subj.feature_table
+
+        if "ACT" in modality:
+            movement_features = all_features.filter(regex="_acc")[
+                ["_acc_mean_1"]
+            ]
+            features = pd.concat([features, movement_features], axis=1)
+        if "HRV" in modality:
+            if dataset_cls_name == "D04MainStudy":
+                hrv_features = all_features.filter(regex="_hrv")[
+                    [
+                        "30_hrv_median_nni", "30_hrv_ratio_sd2_sd1",
+                        "150_hrv_median_nni", "150_hrv_vlf",
+                        "150_hrv_lf", "150_hrv_hf",
+                        "150_hrv_lf_hf_ratio", "150_hrv_total_power",
+                    ]
+                ]
+            elif dataset_cls_name in ("MesaDataset", "ShhsDataset", "MixedDataset"):
+                hrv_features = all_features.filter(regex="_hrv")[
+                    [
+                        "_hrv_median_nni", "_hrv_ratio_sd2_sd1",
+                        "_hrv_median_nni",
+                        "_hrv_vlf", "_hrv_lf", "_hrv_hf",
+                        "_hrv_lf_hf_ratio", "_hrv_total_power",
+                    ]
+                ]
+            else:
+                raise AttributeError("Dataset not known")
+            features = pd.concat([features, hrv_features], axis=1)
+        if "RRV" in modality:
+            rrv_features = all_features.filter(regex="RRV")[
+                ["150_RRV_MedianBB", "150_RRV_LF",
+                 "270_RRV_MCVBB", "150_RRV_CVBB"]
+            ]
+            features = pd.concat([features, rrv_features], axis=1)
+        if "EDR" in modality:
+            edr_features = all_features.filter(regex="EDR")[
+                ["150_EDR_MeanBB", "150_EDR_LF",
+                 "150_EDR_HF", "150_EDR_LFHF"]
+            ]
+            features = pd.concat([features, edr_features], axis=1)
+
+        if classification_type == "binary":
+            ground_truth = subj.ground_truth["sleep"]
+        else:
+            ground_truth = subj.ground_truth
+            ground_truth = ground_truth[classification_type]
+
+        return features, ground_truth
+
     def get_data(
         self,
         dataset: Dataset,
@@ -130,55 +189,9 @@ class DataPreparation:
         """
         # ---- 特征提取辅助函数 ----
         def _extract_subj_features(subj):
-            features = pd.DataFrame()
-            all_features = subj.feature_table
-
-            if "ACT" in modality:
-                movement_features = all_features.filter(regex="_acc")[
-                    ["_acc_mean_1"]
-                ]
-                features = pd.concat([features, movement_features], axis=1)
-            if "HRV" in modality:
-                if dataset.__class__.__name__ == "D04MainStudy":
-                    hrv_features = all_features.filter(regex="_hrv")[
-                        [
-                            "30_hrv_median_nni", "30_hrv_ratio_sd2_sd1",
-                            "150_hrv_median_nni", "150_hrv_vlf",
-                            "150_hrv_lf", "150_hrv_hf",
-                            "150_hrv_lf_hf_ratio", "150_hrv_total_power",
-                        ]
-                    ]
-                elif dataset.__class__.__name__ in ("MesaDataset", "ShhsDataset", "MixedDataset"):
-                    hrv_features = all_features.filter(regex="_hrv")[
-                        [
-                            "_hrv_median_nni", "_hrv_ratio_sd2_sd1",
-                            "_hrv_median_nni",
-                            "_hrv_vlf", "_hrv_lf", "_hrv_hf",
-                            "_hrv_lf_hf_ratio", "_hrv_total_power",
-                        ]
-                    ]
-                else:
-                    raise AttributeError("Dataset not known")
-                features = pd.concat([features, hrv_features], axis=1)
-            if "RRV" in modality:
-                rrv_features = all_features.filter(regex="RRV")[
-                    ["150_RRV_MedianBB", "150_RRV_LF",
-                     "270_RRV_MCVBB", "150_RRV_CVBB"]
-                ]
-                features = pd.concat([features, rrv_features], axis=1)
-            if "EDR" in modality:
-                edr_features = all_features.filter(regex="EDR")[
-                    ["150_EDR_MeanBB", "150_EDR_LF",
-                     "150_EDR_HF", "150_EDR_LFHF"]
-                ]
-                features = pd.concat([features, edr_features], axis=1)
-
-            if classification_type == "binary":
-                ground_truth = subj.ground_truth["sleep"]
-            else:
-                ground_truth = subj.ground_truth
-                ground_truth = ground_truth[classification_type]
-
+            features, ground_truth = self._extract_subj_features_raw(
+                subj, dataset.__class__.__name__, modality, classification_type
+            )
             return self.get_sequence_data(features, ground_truth,
                                           overlap=overlap, padding=padding)
 
@@ -212,7 +225,39 @@ class DataPreparation:
 
         return x_tensor, y_tensor, scaler
 
-    def get_final_tensors(self, modality, train: Dataset, val: Dataset, test: Dataset, classification_type="binary"):
+    def get_frame_data(self, dataset, scaler, modality, classification_type="binary"):
+        """Stateful 路径: 逐被试原始帧 (n, F) + 标签 (n,) + subj_id。
+
+        ✅2026-08-11 - rdwang: 有状态训练/推理使用逐帧数据 (不做滑窗)。
+        返回 list of (x_s (n,F) float32, y_s (n,) float32, subj_id str)。
+
+        ⚠️ scaler 必须复用 get_final_tensors 拟合的 (窗口/padded 数据) 训练集 scaler:
+        若在帧上重拟合, 与 stateless 的缩放不一致, 会破坏 stateless↔stateful 可比性
+        与 --load-weights 微调无状态 checkpoint 的兼容性。
+        """
+        dataset_cls_name = dataset.__class__.__name__
+        frames = []
+        for subj in dataset:
+            features, ground_truth = self._extract_subj_features_raw(
+                subj, dataset_cls_name, modality, classification_type
+            )
+            feature_arr = np.asarray(features)
+            gt_arr = np.asarray(ground_truth)
+            n = feature_arr.shape[0]
+            if n == 0:
+                continue  # 空夜跳过 (正常被试 n >> seq_len)
+            x_scaled = scaler.transform(feature_arr)  # (n, F), 与 get_data 同 scaler
+            subj_id = subj.index["subj_id"][0]  # 与 test_to_list 一致的 id 取值 (含 MixedDataset 前缀)
+            frames.append(
+                (
+                    torch.from_numpy(x_scaled.astype(np.float32)),
+                    torch.from_numpy(gt_arr.astype(np.float32)),
+                    str(subj_id),
+                )
+            )
+        return frames
+
+    def get_final_tensors(self, modality, train: Dataset, val: Dataset, test: Dataset, classification_type="binary", scaler=None):
         """
         Return final sequential tensors for each input modality
         This is the function that gets called in class LSTM_Optuna
@@ -220,6 +265,9 @@ class DataPreparation:
         :param train: Training set
         :param val: Validation set
         :param test: Test set
+        :param scaler: 预拟合的 StandardScaler (如 --load-weights 的配套 scaler); None 则用 train 拟合。
+            ✅2026-08-13: 归一化参数是模型的一部分 — 加载 checkpoint 时必须用其配套 scaler,
+            否则权重与归一化来自不同分布, 评估/微调结果静默失真
         """
 
         mod_set = {"HRV", "ACT", "RRV", "EDR"}
@@ -228,7 +276,7 @@ class DataPreparation:
 
         x_train, y_train, scaler = self.get_data(
             train,
-            scaler=None,
+            scaler=scaler,
             overlap=self.overlap,
             modality=modality,
             classification_type=classification_type,

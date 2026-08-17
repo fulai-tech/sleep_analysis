@@ -28,6 +28,7 @@ LSTM 训练脚本 —— 使用论文 Krauss et al. (2025) 中的最优参数
 import argparse
 import json
 import pickle
+import sys
 import random
 import shutil
 import warnings
@@ -90,6 +91,20 @@ parser.add_argument("--eval-only", action="store_true",
                     help="仅评估，跳过训练")
 parser.add_argument("--causal", action="store_true",
                     help="实时分期模式: 仅在序列左侧padding, 预测每个窗口的最后时刻")
+parser.add_argument("--stateful", action="store_true",
+                    help="状态化模式 (2026-08-11): 逐 epoch 扫描 + LSTM 状态携带 + truncated BPTT 训练; "
+                         "需要 --causal。消除滑窗重算 (端侧每帧 O(1)), 上下文不受 seq-len 限制")
+parser.add_argument("--state-chunk", type=int, default=64,
+                    help="truncated BPTT 截断长度 C (stateful 训练); P = batch_size // C 个被试并行")
+parser.add_argument("--patience", type=int, default=5,
+                    help="早停耐心: 验证 loss 连续 N 个 epoch 不降即停 "
+                         "(stateful 训练摆动周期较长时可调大到 10-15)")
+parser.add_argument("--inv-freq", action="store_true",
+                    help="类权重改为 1/freq (论文公式, 少数类惩罚更重; 默认 1-freq)。"
+                         "stateful 的深夜 deep 被时间捷径献祭时用")
+parser.add_argument("--internal-norm", action="store_true",
+                    help="恢复旧版模型内部 per-batch 归一化 (08-07 前行为, 复现 08-06 基线用)。"
+                         "默认关闭 (外部 scaler 作为唯一归一化)")
 
 args = parser.parse_args()
 
@@ -115,9 +130,29 @@ if args.load_weights:
         args.grad_clip = saved_config.get("grad_clip", args.grad_clip)
         args.causal = saved_config.get("causal", args.causal)
         args.seed = saved_config.get("seed", args.seed)
+        args.stateful = saved_config.get("stateful", args.stateful)
+        args.state_chunk = saved_config.get("state_chunk", args.state_chunk)
+        args.patience = saved_config.get("patience", args.patience)
+        args.inv_freq = saved_config.get("inv_freq", args.inv_freq)
+        args.internal_norm = saved_config.get("internal_norm", args.internal_norm)
+        args.split_file = saved_config.get("split_file", args.split_file)
     else:
         print(f"[WARNING] {config_file} not found, using current CLI params."
               f" 确保超参数与训练时一致，否则 load_state_dict 会报错!")
+
+# ✅2026-08-11: stateful 依赖因果窗口 (状态化 = 只用已见数据); 校验须在 config restore 之后,
+# 否则 --load-weights <causal run> --stateful 会被 parse 期校验误杀 (causal 在 restore 后才恢复)
+if args.stateful and not args.causal:
+    print("[ERROR] --stateful requires --causal (状态化模式依赖因果窗口)", flush=True)
+    sys.exit(1)
+# ✅2026-08-12: state_chunk 是 truncated BPTT 截断长度, 也是分组除数/range step —
+# 0 或负数会在 _stateful_groups/_stateful_build_chunk 里 ZeroDivisionError 或静默空转
+if args.stateful and args.state_chunk <= 0:
+    print(f"[ERROR] --state-chunk must be a positive integer (got {args.state_chunk})", flush=True)
+    sys.exit(1)
+if args.patience < 1:
+    print(f"[ERROR] --patience must be >= 1 (got {args.patience})", flush=True)
+    sys.exit(1)
 
 # 快速测试覆盖
 if args.quick:
@@ -268,6 +303,12 @@ config = {
     "focal_gamma": args.focal_gamma,
     "grad_clip": args.grad_clip,
     "causal": args.causal,
+    "stateful": args.stateful,
+    "state_chunk": args.state_chunk,
+    "patience": args.patience,
+    "inv_freq": args.inv_freq,
+    "internal_norm": args.internal_norm,
+    "split_file": args.split_file,
     "seed": args.seed,
     "load_weights": args.load_weights,
     # 数据来源 (完整快照见同目录 study_data.json)
@@ -328,12 +369,24 @@ if args.split_file is not None:
         else:
             # 混合数据集: 按 src 前缀 (与 MixedDataset 的 subj_id 前缀一致) 匹配各自名单
             _src_name_map = {name.lower().replace("_", ""): name for name in DATASET_PARTS}
+            # ✅2026-08-13: 命令行请求的数据集若在名单中缺失, 下面的循环只会重建名单中存在的源,
+            # MixedDataset 由残缺 dict 构建 → 该数据集被静默丢弃, 一致性检查也只比对重建的源,
+            # 发现不了 → 显式报错
+            _missing_keys = {k for k in _src_name_map if k not in _want}
+            if _missing_keys:
+                print(f"[ERROR] --split-file 缺失数据集名单: {sorted(_missing_keys)} "
+                      f"(请求 {sorted(_src_name_map)}, 名单只有 {sorted(_want)})", flush=True)
+                sys.exit(1)
             _train_sources, _val_sources, _test_sources = {}, {}, {}
             for _src_key, _parts in _want.items():
                 if _src_key not in _src_name_map:
                     print(f"[WARNING] split 名单中的数据集 {_src_key} 不在本次训练数据集内, 跳过")
                     continue
                 ds = _DS_REGISTRY[_src_name_map[_src_key]]()
+                if args.small:
+                    # ✅2026-08-13: 与其他分支一致 — split-file 混合模式此前漏掉 --small 切片,
+                    # 导致 smoke 跑在全量数据上
+                    ds = ds[0:20]
                 _ids = [str(s) for s in ds.index["subj_id"]]
                 _tr = [i for i, sid in enumerate(_ids) if sid in _parts["train"]]
                 _va = [i for i, sid in enumerate(_ids) if sid in _parts["val"]]
@@ -408,17 +461,65 @@ if not _singleton:
         msg += f"\n    {split_name}: {parts}"
 print(msg)
 
+# ✅2026-08-13: 空 train/val 划分是致命的 (stateful: torch.cat([]) 崩; stateless: scaler 无从拟合),
+# split 解析只告警不中止 → 在数据加载前显式报错, 给出可读的错误信息
+if len(train_set) == 0:
+    print("[ERROR] train split is empty — 名单与数据无交集, 无法训练 (检查 --split-file)", flush=True)
+    sys.exit(1)
+if len(val_set) == 0:
+    print("[ERROR] val split is empty — 无法验证/选择最佳模型 (检查 --split-file)", flush=True)
+    sys.exit(1)
+if len(test_set) == 0:
+    print("[ERROR] test split is empty — 无法评估 (检查 --split-file)", flush=True)
+    sys.exit(1)
+
 # ---------------------------------------------------------------------------
 # 2. 构建序列数据
 # ---------------------------------------------------------------------------
 print("\n[2/5] Preparing sequence data...")
 data_loader = DataPreparation(seq_len=args.seq_len, overlap=None, causal=args.causal)
+
+# ✅2026-08-13: --load-weights 时归一化参数 (scaler) 是模型的一部分 — 必须用 checkpoint 的
+# 配套 scaler.json, 而不是用当前 train_set 重新拟合。否则权重来自 A run、归一化来自当前
+# 数据, --eval-only / 微调结果静默失真 (数据集或划分不同时尤其严重)
+_load_scaler = None
+if args.load_weights:
+    _companion_scaler = Path(args.load_weights).parent / "scaler.json"
+    if _companion_scaler.exists():
+        with open(_companion_scaler) as _f:
+            _sc = json.load(_f)
+        _n_sc = int(_sc["n_features"])
+        if _n_sc != get_num_input(args.modality):
+            print(f"[ERROR] 配套 scaler n_features ({_n_sc}) != 当前 modality 输入维数 "
+                  f"({get_num_input(args.modality)}) — 权重与数据不匹配", flush=True)
+            sys.exit(1)
+        from sklearn.preprocessing import StandardScaler
+        _load_scaler = StandardScaler()
+        _load_scaler.n_features_in_ = _n_sc
+        _load_scaler.mean_ = np.array(_sc["mean_"], dtype=np.float64)
+        _load_scaler.scale_ = np.array(_sc["scale_"], dtype=np.float64)
+        print(f"  Companion scaler loaded from: {_companion_scaler}")
+    else:
+        print(f"  [WARN] No companion scaler found at {_companion_scaler} — "
+              f"将用当前 train_set 拟合 scaler (与 checkpoint 不配套, 结果不可靠!)")
+
 x_train, y_train, x_val, y_val, x_test, y_test, scaler = data_loader.get_final_tensors(
-    args.modality, train_set, val_set, test_set, args.classification
+    args.modality, train_set, val_set, test_set, args.classification, scaler=_load_scaler
 )
 print(f"  x_train: {x_train.shape}, y_train: {y_train.shape}")
 print(f"  x_val:   {x_val.shape}, y_val:   {y_val.shape}")
 print(f"  x_test:  {len(x_test)} subjects")
+
+# ✅2026-08-11: stateful 模式 — 构建逐被试帧数据 (复用窗口路径拟合的训练集 scaler,
+# 保证 stateless↔stateful 缩放一致与 --load-weights 兼容); 训练/测试改传 frames
+if args.stateful:
+    train_frames = data_loader.get_frame_data(train_set, scaler, args.modality, args.classification)
+    val_frames = data_loader.get_frame_data(val_set, scaler, args.modality, args.classification)
+    test_frames = data_loader.get_frame_data(test_set, scaler, args.modality, args.classification)
+    _n_frames = lambda fs: sum(t[0].shape[0] for t in fs)
+    print(f"  [stateful] train frames: {len(train_frames)} subj / {_n_frames(train_frames)} epochs")
+    print(f"  [stateful] val frames:   {len(val_frames)} subj / {_n_frames(val_frames)} epochs")
+    print(f"  [stateful] test frames:  {len(test_frames)} subj / {_n_frames(test_frames)} epochs")
 
 # 保存第一层 StandardScaler（训练集拟合），推理时必需
 checkpoints_dir = OUTPUT_DIR / "checkpoints"
@@ -436,12 +537,22 @@ print(f"  Scaler saved to: {scaler_path}")
 val_sources_dict = {}
 if not _singleton:
     for src_name, src_ds in _val_sources.items():
-        xs, ys, _ = data_loader.get_data(
-            src_ds, modality=args.modality, scaler=scaler,  # 复用训练集 scaler
-            classification_type=args.classification, padding=True
-        )
-        val_sources_dict[src_name] = (xs, ys)
-    print(f"  val sources: { {k: v[0].shape[0] for k, v in val_sources_dict.items()} }")
+        if args.stateful:
+            # stateful: per-source frames list
+            val_sources_dict[src_name] = data_loader.get_frame_data(
+                src_ds, scaler=scaler, modality=args.modality,
+                classification_type=args.classification
+            )
+        else:
+            xs, ys, _ = data_loader.get_data(
+                src_ds, modality=args.modality, scaler=scaler,  # 复用训练集 scaler
+                classification_type=args.classification, padding=True
+            )
+            val_sources_dict[src_name] = (xs, ys)
+    if args.stateful:
+        print(f"  val sources: { {k: sum(t[0].shape[0] for t in v) for k, v in val_sources_dict.items()} }")
+    else:
+        print(f"  val sources: { {k: v[0].shape[0] for k, v in val_sources_dict.items()} }")
 
 # ---------------------------------------------------------------------------
 # 3. 创建模型
@@ -467,18 +578,18 @@ model = LSTM(
     focal_gamma=args.focal_gamma,
     grad_clip=args.grad_clip,
     val_sources=val_sources_dict if not _singleton else None,
+    stateful=args.stateful,
+    state_chunk=args.state_chunk,
+    patience=args.patience,
+    inv_freq=args.inv_freq,
+    internal_norm=args.internal_norm,
 )
 
 # 加载已有权重 (如果指定)
 if args.load_weights:
     print(f"  Loading weights from: {args.load_weights}")
     model._load_best_model_from_path(args.load_weights)
-    # 检查同目录下是否有配套的 scaler.json
-    companion_scaler = Path(args.load_weights).parent / "scaler.json"
-    if companion_scaler.exists():
-        print(f"  Companion scaler found: {companion_scaler}")
-    else:
-        print(f"  [WARN] No companion scaler found at {companion_scaler}")
+    # 配套 scaler 已在数据加载前处理 (见 [2/5] 的 companion scaler 逻辑)
 
 # ---------------------------------------------------------------------------
 # 4. 训练 (--eval-only 则跳过)
@@ -486,7 +597,8 @@ if args.load_weights:
 if not args.eval_only:
     print("\n[4/5] Training...")
     print("-" * 60)
-    max_val_mcc = model.train(x_train, y_train, x_val, y_val, retrain=False)
+    _train_args = (train_frames, None, val_frames, None) if args.stateful else (x_train, y_train, x_val, y_val)
+    max_val_mcc = model.train(*_train_args, retrain=False)
     print(f"\n  Best validation MCC: {max_val_mcc:.4f}")
 else:
     print("\n[4/5] Skipping training (--eval-only)")
@@ -496,7 +608,8 @@ else:
 # 5. 测试 & 保存结果
 # ---------------------------------------------------------------------------
 print("\n[5/5] Evaluating on test set...")
-subject_results, score_mean, pred_dict = model.test(x_test, y_test, retrain=False)
+_test_args = (test_frames, None) if args.stateful else (x_test, y_test)
+subject_results, score_mean, pred_dict = model.test(*_test_args, retrain=False)
 
 results_dir = OUTPUT_DIR / "results"
 results_dir.mkdir(parents=True, exist_ok=True)
