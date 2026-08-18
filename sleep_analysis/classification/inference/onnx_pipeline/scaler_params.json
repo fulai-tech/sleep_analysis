@@ -33,5 +33,6 @@
   "modality": [
     "HRV",
     "RRV"
-  ]
+  ],
+  "night_norm": true
 }

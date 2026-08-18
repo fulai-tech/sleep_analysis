@@ -1,0 +1,4 @@
+test_set/
+evaluate_results/
+predictions.csv
+model.onnx

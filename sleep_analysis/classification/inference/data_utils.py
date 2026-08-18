@@ -224,6 +224,43 @@ def apply_scaler(
 
 
 # ---------------------------------------------------------------------------
+# 第二层归一化 — 模型外"整夜"实现 (复现训练代码测试 pipeline)
+# ---------------------------------------------------------------------------
+
+def apply_night_norm(x: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+    """
+    模型外"整夜归一化" — 复现原 model.py forward 中的第二层 per-batch 归一化，
+    但统计量固定为该被试整夜数据（所有窗口 × 时间步），而非模型输入 batch 的统计。
+
+    背景:
+      - 原代码 (model.py forward, 2026-08-03 及更早) 在模型内部做
+        mean = x.mean(dim=(0,1)); std = x.std(dim=(0,1), unbiased=True) + eps
+      - 训练时统计量 = 当前 batch (512 序列混合); 测试时 LSTM.py::test 逐被试调用
+        forward → 统计量 = 该被试整夜全部序列 (整夜统计)
+      - 若把该 norm 留在 ONNX 图内, 统计量取决于推理时喂入的 batch —
+        逐帧/流式推理时每个窗口统计不同, 与测试 pipeline 不一致
+      - 因此在 Python 侧用整夜数据预先算好统计量并应用, 模型图内不再包含归一化;
+        无论整批还是流式推理, 统计量固定为整夜 → 与训练代码测试 pipeline 严格一致
+
+    eps 默认 1e-5: 与 2026-08-03 重训练版 (retrain_1e_5, model.py eps=1e-5) 一致。
+    若未来训练使用其他 eps, 请传入一致的值。
+
+    Parameters
+    ----------
+    x : np.ndarray  shape (n_windows, seq_len, n_features), float32
+    eps : float  防除零常数
+
+    Returns
+    -------
+    x_norm : np.ndarray  same shape and dtype
+    """
+    mean = x.mean(axis=(0, 1), keepdims=True)
+    # ddof=1 对齐 torch.std(dim=(0,1), unbiased=True); 在 float32 上计算
+    std = x.std(axis=(0, 1), ddof=1, keepdims=True) + eps
+    return (x - mean) / std
+
+
+# ---------------------------------------------------------------------------
 # 数据加载
 # ---------------------------------------------------------------------------
 
@@ -391,9 +428,37 @@ def compute_metrics(
         "recall": sk_metrics.recall_score(y_true, y_pred, zero_division=0, average="weighted"),
         "f1": sk_metrics.f1_score(y_true, y_pred, zero_division=0, average="weighted"),
         "kappa": sk_metrics.cohen_kappa_score(y_true, y_pred),
+        "specificity": multiclass_specificity(y_true, y_pred, labels=labels),
         "mcc": matthews_corrcoef(y_true, y_pred),
         "confusion_matrix": conf_mat.tolist(),
     }
+
+
+def multiclass_specificity(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    labels: list,
+) -> float:
+    """
+    多分类 weighted specificity — 与 dl_scoring.py::dl_multiclass_specificity 一致。
+    每个类别 specificity = TN / (TN + FP)，按真实类别比例加权。
+    """
+    conf_mat = confusion_matrix(y_true, y_pred, labels=labels)
+    weights = []
+    specificities = []
+    n_total = len(y_true)
+    for l, label in enumerate(labels):
+        tp = conf_mat[l][l]
+        tn = np.sum(conf_mat) - np.sum(conf_mat[:, l]) - np.sum(conf_mat[l, :]) + conf_mat[l][l]
+        fp = np.sum(conf_mat[l, :]) - conf_mat[l][l]
+        fn = np.sum(conf_mat[:, l]) - conf_mat[l][l]
+
+        weight = np.sum(np.asarray(y_true) == label) / n_total
+        weights.append(weight)
+        value = np.nan_to_num(tn / (tn + fp))
+        specificities.append(value)
+
+    return float(np.sum(np.array(specificities) * np.array(weights)))
 
 
 def _sanitize_prediction(pred: np.ndarray, classification_type: str) -> np.ndarray:

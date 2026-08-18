@@ -16,6 +16,7 @@ import pandas as pd
 
 from sleep_analysis.classification.deep_learning.utils import get_num_classes, get_num_input
 from sleep_analysis.classification.inference.data_utils import (
+    apply_night_norm,
     apply_scaler,
     build_sequences,
     compute_metrics,
@@ -38,12 +39,15 @@ class OnnxInferenceEngine:
                                                 processed_path=Path(".../mesa_processed"))
     """
 
-    def __init__(self, run_dir: Path):
+    def __init__(self, run_dir: Path, night_norm: Optional[bool] = None):
         """
         Parameters
         ----------
         run_dir : Path
             训练运行目录，包含 config.json、checkpoints/model.onnx、checkpoints/scaler.json。
+        night_norm : bool or None
+            是否启用模型外"整夜归一化"（复现训练代码测试 pipeline 的第二层 norm）。
+            None → 从 config.json 的 "night_norm" 字段读取（默认 False）。
         """
         import onnxruntime as ort
 
@@ -60,6 +64,16 @@ class OnnxInferenceEngine:
         self.seq_len = self.config.get("seq_len", 21)
         self.causal = self.config.get("causal", False)  # 注意: 只控制序列 padding 方向, 与 processing_config.causal (数据生成) 无关
         self.stateful = self.config.get("stateful", False)  # ✅2026-08-11: 有状态推理 (逐帧扫描)
+
+        # ✅2026-08-18: 模型外整夜归一化 (第二层 norm 的模型外实现)
+        # 旧模型 (2026-08-07 之前训练, 如 2026-08-03_202132) 的 forward 内含 per-batch norm;
+        # 训练代码测试 pipeline 中该 norm 的统计量 = 被试整夜数据。要在推理时复现,
+        # norm 不能留在模型图内 (图内 norm 统计量取决于喂入 batch), 应在 Python 侧
+        # 用整夜数据预先计算并应用。stateful 模型 (8-11 之后训练) 无此需求。
+        if night_norm is None:
+            self.night_norm = self.config.get("night_norm", False)
+        else:
+            self.night_norm = night_norm
 
         # 加载第一层 scaler
         self.scaler_mean, self.scaler_scale = load_scaler(self.run_dir)
@@ -86,6 +100,7 @@ class OnnxInferenceEngine:
         print(f"  input_size: {self.input_size}")
         print(f"  onnx model: {onnx_path}")
         print(f"  provider: CPUExecutionProvider")
+        print(f"  night_norm: {self.night_norm}")
 
     def _find_onnx_model(self) -> Path:
         """查找 ONNX 模型文件。"""
@@ -171,6 +186,10 @@ class OnnxInferenceEngine:
 
             # ---- 4. 第一层标准化 ----
             x = apply_scaler(x, self.scaler_mean, self.scaler_scale)
+
+            # ---- 4b. 第二层归一化 (模型外整夜) ----
+            if self.night_norm:
+                x = apply_night_norm(x)   # 统计量 = 被试整夜数据, 与训练测试 pipeline 一致
 
             # ---- 5. ONNX 推理 ----
             onnx_out = self.session.run(

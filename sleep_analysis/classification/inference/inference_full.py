@@ -200,18 +200,19 @@ def run_feature_inference(
     backend: str,
     processed_path: Path,
     output_dir: Optional[Path] = None,
+    night_norm: Optional[bool] = None,
 ) -> dict:
     """
     从预处理特征出发，完成推理 + 与标注对比。
     """
     if backend == "torch":
         from sleep_analysis.classification.inference.engine_torch import TorchInferenceEngine
-        engine = TorchInferenceEngine(run_dir)
+        engine = TorchInferenceEngine(run_dir, night_norm=night_norm)
     elif backend == "onnx":
         # ONNX engine 将在 engine_onnx.py 中实现
         try:
             from sleep_analysis.classification.inference.engine_onnx import OnnxInferenceEngine
-            engine = OnnxInferenceEngine(run_dir)
+            engine = OnnxInferenceEngine(run_dir, night_norm=night_norm)
         except ImportError:
             print("[ERROR] ONNX engine not available yet. 请使用 --backend torch。")
             sys.exit(1)
@@ -257,6 +258,9 @@ def main():
                         help="输出目录 (默认: {run_dir}/inference_results)")
     parser.add_argument("--full-pipeline", action="store_true",
                         help="若特征缺失, 运行完整 6 步预处理管线 (需 mesa_data_importer 等依赖)")
+    parser.add_argument("--night-norm", action="store_true",
+                        help="启用模型外整夜归一化 (复现训练代码测试 pipeline 的第二层 norm; "
+                             "适用于 2026-08-07 之前训练的旧模型)")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -300,6 +304,7 @@ def main():
         backend=args.backend,
         processed_path=processed_path,
         output_dir=output_dir,
+        night_norm=True if args.night_norm else None,
     )
 
     return result

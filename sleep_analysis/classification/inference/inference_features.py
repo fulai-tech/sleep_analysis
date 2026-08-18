@@ -120,6 +120,7 @@ def run_inference(
     subject_id: str,
     backend: str,
     output_dir: Optional[Path] = None,
+    night_norm: Optional[bool] = None,
 ) -> dict:
     """
     对单个被试执行推理。
@@ -128,10 +129,10 @@ def run_inference(
     """
     if backend == "torch":
         from sleep_analysis.classification.inference.engine_torch import TorchInferenceEngine
-        engine = TorchInferenceEngine(run_dir)
+        engine = TorchInferenceEngine(run_dir, night_norm=night_norm)
     elif backend == "onnx":
         from sleep_analysis.classification.inference.engine_onnx import OnnxInferenceEngine
-        engine = OnnxInferenceEngine(run_dir)
+        engine = OnnxInferenceEngine(run_dir, night_norm=night_norm)
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
@@ -229,6 +230,9 @@ def main():
 
     parser.add_argument("--output-dir", type=str, default=None,
                         help="输出目录 (默认: {run_dir}/inference_results)")
+    parser.add_argument("--night-norm", action="store_true",
+                        help="启用模型外整夜归一化 (复现训练代码测试 pipeline 的第二层 norm; "
+                             "适用于 2026-08-07 之前训练的旧模型)")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -258,6 +262,7 @@ def main():
             subject_id=subj_id,
             backend=args.backend,
             output_dir=output_dir,
+            night_norm=True if args.night_norm else None,
         )]
     else:
         # 模式 A: 被试 + 数据集
@@ -278,6 +283,7 @@ def main():
                 subject_id=subj,
                 backend=args.backend,
                 output_dir=output_dir,
+                night_norm=True if args.night_norm else None,
             ))
 
     # 汇总

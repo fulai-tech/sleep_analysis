@@ -30,6 +30,10 @@ SCALER_JSON = SCRIPT_DIR / "scaler_params.json"
 MODEL_ONNX = SCRIPT_DIR / "model.onnx"
 OUTPUT_CSV = SCRIPT_DIR / "predictions.csv"
 
+# onnxruntime 日志级别: 3 = warning 及以上 (默认), 显式设置保证行为确定
+import onnxruntime as ort
+ort.set_default_logger_severity(3)
+
 # 分类标签映射
 STAGE_NAMES = {
     "binary":  {0: "Wake", 1: "Sleep"},
@@ -75,6 +79,23 @@ def apply_scaler(x: np.ndarray, mean_: np.ndarray, scale_: np.ndarray) -> np.nda
     return (x - mean_) / (scale_ + eps)
 
 
+def apply_night_norm(x: np.ndarray, eps: float = 1e-5) -> np.ndarray:
+    """
+    整夜归一化 (第二层 norm 的模型外实现)。
+
+    该模型 (2026-08-03 训练) 的 forward 内含 per-batch 归一化:
+        mean = x.mean(dim=(0,1)); std = x.std(dim=(0,1), unbiased=True) + eps
+    训练代码测试 pipeline 中该 norm 的统计量 = 该被试整夜数据。
+    推理时在 Python 侧用整夜数据预先计算并应用 (模型图内不含归一化),
+    保证与训练代码测试 pipeline 结果一致, 且与喂入 batch 大小无关。
+
+    eps=1e-5 与训练时一致。ddof=1 对齐 torch.std(unbiased=True)。
+    """
+    mean = x.mean(axis=(0, 1), keepdims=True)
+    std = x.std(axis=(0, 1), ddof=1, keepdims=True) + eps
+    return (x - mean) / std
+
+
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
@@ -94,14 +115,19 @@ def main():
     seq_len = scaler_cfg["seq_len"]
     causal = scaler_cfg.get("causal", False)
     classification = scaler_cfg["classification_type"]
+    night_norm = scaler_cfg.get("night_norm", False)
     mean_ = np.array(scaler_cfg["mean_"])
     scale_ = np.array(scaler_cfg["scale_"])
     print(f"[2/5] Scaler loaded: seq_len={seq_len}, causal={causal}, "
-          f"classification={classification}")
+          f"classification={classification}, night_norm={night_norm}")
 
-    # 3. 构建序列 + 标准化
+    # 3. 构建序列 + 第一层标准化 (训练集拟合 scaler)
     x = build_sequences(features, seq_len=seq_len, causal=causal)
     x = apply_scaler(x, mean_, scale_)
+
+    # 3b. 第二层归一化 (整夜, 模型外) — 复现训练测试 pipeline
+    if night_norm:
+        x = apply_night_norm(x)
     print(f"[3/5] Sequences built: {x.shape}")
 
     # 4. ONNX 推理
