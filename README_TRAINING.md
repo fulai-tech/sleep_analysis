@@ -380,6 +380,19 @@ python sleep_analysis/classification/inference/inference_features.py \
     --run-dir exports_our/<timestamp> --subject <ID> --backend torch|onnx
 ```
 
+### 特征平移（--lookahead-min）
+
+`--lookahead-min N`（分钟，可为负）通用化窗口相对预测点的平移量 k = 2N（epoch）：预测目标 j 的窗口 = `[j-(S-1)+k, j+k]`。
+
+| 值 | 语义 |
+|---|---|
+| `5` | 原版居中（向后看 5 min，与不传 `--causal` 的历史行为逐位一致） |
+| `0` | 实时（等价 `--causal`，逐位一致） |
+| `1` | 向后看 1 min |
+| `-1` 或更负 | 预测点晚于数据（用更早的数据预测，右裁剪 + 左边缘垫） |
+
+与 `--causal` 二选一；stateful 强制 k=0（校验报错）。k≤0 用 edge 垫（无泄漏），k>0 用整夜均值垫（原版语义，含未来）。config.json 记录 `lookahead_min`，两个推理引擎自动按它对齐窗口。
+
 ### 已知问题 / 决策记录
 
 - `rrv.py`: RRV 因果改造（滤波 + 左对齐窗口），causal 分支由 `SLEEP_CAUSAL` 控制

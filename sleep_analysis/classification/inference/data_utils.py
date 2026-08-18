@@ -146,22 +146,28 @@ def build_sequences(
     features: np.ndarray,
     seq_len: int = 21,
     causal: bool = False,
+    lookahead_min: int = None,
 ) -> np.ndarray:
     """
     将 (n_epochs, n_features) 的特征矩阵转为滑动窗口序列。
 
-    与 data_peparation.py 的 padding=True + sliding_window 逻辑一致：
-      - causal=False: 居中 padding，每端各垫 seq_len/2 个均值
-      - causal=True:  仅左侧 padding (实时分期)
+    与 data_peparation.py 的 padding=True + sliding_window 逻辑一致。
+    ✅2026-08-17: 通用特征平移 — 预测目标 j 的窗口 = [j-(S-1)+k, j+k],
+      k = lookahead_min*2 (epoch)。未传 lookahead_min 时由 causal 推导
+      (causal→0, 否则→seq_len//2), 与历史行为逐位一致:
+      - k=0 : 实时 (左侧 edge 垫, 无未来)
+      - k>0 : 向后看 k/2 分钟 (mean 垫; k=10 即原版居中)
+      - k<0 : 用过去预测 (右侧裁剪 + 左侧 edge 垫)
 
     Parameters
     ----------
     features : np.ndarray  shape (n_epochs, n_features)
     seq_len : int  窗口长度 (epoch 数)
-    causal : bool  是否实时模式 (仅历史 padding)
+    causal : bool  是否实时模式 (仅历史 padding) — lookahead_min 未给出时的回退
+    lookahead_min : int or None  特征平移分钟数 (可负); None=由 causal 推导
 
-    注意: 此 causal 只控制序列窗口的 padding 方向（模型输入层, 由训练时 config.json 的
-    "causal" 决定），与 sleep_analysis.processing_config.causal（数据生成阶段的 RRV
+    注意: causal/lookahead 只控制序列窗口的 padding 方向（模型输入层, 由训练时
+    config.json 决定），与 sleep_analysis.processing_config.causal（数据生成阶段的 RRV
     滤波/降采样因果性, 由 SLEEP_CAUSAL 环境变量决定, 固化在特征文件中）是**两个独立
     开关**。推理引擎的 causal=True 不使 RR 间期预处理（process_rpoint, 当前永久原版）
     或特征提取变得因果 — 特征的因果性由数据生成时决定。
@@ -172,18 +178,30 @@ def build_sequences(
     """
     n_epochs, n_features = features.shape
 
-    if causal:
-        # 仅在左侧垫 (seq_len - 1) 个首值 — 实时语义 (只有最早到达的数据, 无未来依赖)
-        # 2026-08-07: 原为整夜均值填充 (含未来 epoch), 与 data_peparation.py 的 mode="edge" 同步
-        padded = np.pad(features, ((seq_len - 1, 0), (0, 0)), mode="edge")
+    k = lookahead_min * 2 if lookahead_min is not None else (0 if causal else seq_len // 2)
+    L = seq_len - 1 - k   # 左垫
+    R = k                # 右垫 (负=裁剪, numpy 支持)
+
+    if k <= 0:
+        # 实时语义: 左侧 edge 垫 (只有最早到达的数据, 无未来依赖); k<0 时右侧裁剪
+        # (numpy 不接受负 pad 宽度 → 显式切片裁剪)
+        if R < 0:
+            features = features[:R]
+            R = 0
+        if L < 0:
+            features = features[-L:]
+            L = 0
+        padded = np.pad(features, ((L, R), (0, 0)), mode="edge")
     else:
-        # 居中：左右各垫一半, 均值填充 (原版, 复现作者路径)
-        pad_left = seq_len // 2
-        pad_right = seq_len // 2
+        # 原版语义: mean 垫 (k=10 即居中, 与原非 causal 路径逐位一致)
         mean_vals = features.mean(axis=0, keepdims=True)
-        pad_left_arr = np.tile(mean_vals, (pad_left, 1))
-        pad_right_arr = np.tile(mean_vals, (pad_right, 1))
-        padded = np.concatenate([pad_left_arr, features, pad_right_arr], axis=0)
+        parts = []
+        if L > 0:
+            parts.append(np.tile(mean_vals, (L, 1)))
+        parts.append(features)
+        if R > 0:
+            parts.append(np.tile(mean_vals, (R, 1)))
+        padded = np.concatenate(parts, axis=0)
 
     # 滑动窗口：与 biopsykit sliding_window(overlap_percent=None, window_samples=seq_len) 一致
     n_windows = padded.shape[0] - seq_len + 1

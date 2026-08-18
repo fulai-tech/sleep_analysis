@@ -59,6 +59,7 @@ class OnnxInferenceEngine:
         self.num_layers = self.config["num_layers"]
         self.seq_len = self.config.get("seq_len", 21)
         self.causal = self.config.get("causal", False)  # 注意: 只控制序列 padding 方向, 与 processing_config.causal (数据生成) 无关
+        self.lookahead_min = self.config.get("lookahead_min", None)  # ✅2026-08-17: 特征平移(分钟)
         self.stateful = self.config.get("stateful", False)  # ✅2026-08-11: 有状态推理 (逐帧扫描)
 
         # 加载第一层 scaler
@@ -167,7 +168,7 @@ class OnnxInferenceEngine:
             onnx_out = np.stack(logits_list)  # (n, num_classes)
         else:
             # ---- 3. 构建滑动窗口 ----
-            x = build_sequences(features, seq_len=self.seq_len, causal=self.causal)
+            x = build_sequences(features, seq_len=self.seq_len, causal=self.causal, lookahead_min=self.lookahead_min)
 
             # ---- 4. 第一层标准化 ----
             x = apply_scaler(x, self.scaler_mean, self.scaler_scale)

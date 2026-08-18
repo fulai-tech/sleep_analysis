@@ -49,10 +49,16 @@ class DataPreparation:
     :param overlap: Overlap of Sequences: Highly impacts runtime
     """
 
-    def __init__(self, seq_len, overlap, causal=False):
+    def __init__(self, seq_len, overlap, causal=False, lookahead=None):
         self.seq_len = seq_len
         self.overlap = overlap
         self.causal = causal   # True=只在左侧padding (实时分期), False=居中padding (原文)
+        # ✅2026-08-17: lookahead = 特征平移量 (epoch 数, 可负)。
+        #   预测目标 j 的窗口 = [j-(S-1)+k, j+k], k=lookahead。
+        #   k=0 等价因果(实时), k=10 等价原版居中(向后看5min), k=2 向后看1min,
+        #   k=-2 用"更早的数据"预测 (负=预测点晚于窗口右端)。
+        #   未显式传入时由 causal 推导 (causal→0, 否则→seq_len//2), 与历史行为逐位一致。
+        self.lookahead = lookahead if lookahead is not None else (0 if causal else self.seq_len // 2)
 
     def get_sequence_data(self, features: pd.DataFrame, ground_truth: pd.DataFrame, overlap, padding=False):
         """
@@ -73,12 +79,22 @@ class DataPreparation:
         #   mode="edge" 用第一帧特征值填充 (实时语义: 开始时只有最早到达的数据, 无泄漏)。
         #   scaler 是逐特征线性变换, 与 edge-pad 可交换 → 等价于"先 scale 再首值 pad"。
         #   非 causal 分支保持原版 (mode="mean", 复现作者路径不动)。
+        # ✅2026-08-17: 统一为 lookahead k 的通用平移 (L=S-1-k 左垫, R=k 右垫; R<0 为裁剪)。
+        #   k=0 与原 causal 逐位一致 (edge 垫); k>0 与原非 causal 逐位一致 (mean 垫, k=10 即居中);
+        #   k<0 为"用过去预测" (右裁剪 + 左侧 edge 垫, 无未来泄漏)。
         if padding:
-            if self.causal:
-                npad = ((self.seq_len - 1, 0), (0, 0))   # 只垫历史，预测最后时刻
+            L = self.seq_len - 1 - self.lookahead
+            R = self.lookahead
+            if R < 0:   # numpy 不接受负 pad 宽度 → 显式裁剪
+                feature_arr = feature_arr[:R]
+                R = 0
+            if L < 0:
+                feature_arr = feature_arr[-L:]
+                L = 0
+            npad = ((L, R), (0, 0))
+            if self.lookahead <= 0:
                 feature_arr = np.pad(feature_arr, npad, mode="edge")
             else:
-                npad = ((int(self.seq_len / 2), int(self.seq_len / 2)), (0, 0))  # 居中，原文方式
                 feature_arr = np.pad(feature_arr, npad, mode="mean")
             y_mat = ground_truth_arr
             x_mat = bp.utils.array_handling.sliding_window(

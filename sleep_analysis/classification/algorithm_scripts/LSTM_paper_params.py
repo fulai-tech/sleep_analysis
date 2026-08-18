@@ -105,6 +105,9 @@ parser.add_argument("--inv-freq", action="store_true",
 parser.add_argument("--internal-norm", action="store_true",
                     help="恢复旧版模型内部 per-batch 归一化 (08-07 前行为, 复现 08-06 基线用)。"
                          "默认关闭 (外部 scaler 作为唯一归一化)")
+parser.add_argument("--lookahead-min", type=int, default=None,
+                    help="特征平移量 (分钟, 可负): 5=原版向后看5min(居中), 0=实时(等价 --causal), "
+                         "1=向后看1min, -1=预测点晚于数据1min(用过去预测)。与 --causal 二选一")
 
 args = parser.parse_args()
 
@@ -135,6 +138,7 @@ if args.load_weights:
         args.patience = saved_config.get("patience", args.patience)
         args.inv_freq = saved_config.get("inv_freq", args.inv_freq)
         args.internal_norm = saved_config.get("internal_norm", args.internal_norm)
+        args.lookahead_min = saved_config.get("lookahead_min", args.lookahead_min)
         args.split_file = saved_config.get("split_file", args.split_file)
     else:
         print(f"[WARNING] {config_file} not found, using current CLI params."
@@ -142,8 +146,14 @@ if args.load_weights:
 
 # ✅2026-08-11: stateful 依赖因果窗口 (状态化 = 只用已见数据); 校验须在 config restore 之后,
 # 否则 --load-weights <causal run> --stateful 会被 parse 期校验误杀 (causal 在 restore 后才恢复)
-if args.stateful and not args.causal:
-    print("[ERROR] --stateful requires --causal (状态化模式依赖因果窗口)", flush=True)
+# ✅2026-08-17: 统一为 lookahead 平移量 k (epoch 数): --lookahead-min 优先, 否则由 --causal 推导
+if args.lookahead_min is not None and args.causal:
+    print("[ERROR] --lookahead-min 与 --causal 只能二选一", flush=True)
+    sys.exit(1)
+_lookahead_k = (args.lookahead_min * 2 if args.lookahead_min is not None
+                else (0 if args.causal else args.seq_len // 2))
+if args.stateful and _lookahead_k != 0:
+    print(f"[ERROR] --stateful 需要实时对齐 (lookahead=0); 当前 lookahead={_lookahead_k // 2}min", flush=True)
     sys.exit(1)
 # ✅2026-08-12: state_chunk 是 truncated BPTT 截断长度, 也是分组除数/range step —
 # 0 或负数会在 _stateful_groups/_stateful_build_chunk 里 ZeroDivisionError 或静默空转
@@ -309,6 +319,7 @@ config = {
     "inv_freq": args.inv_freq,
     "internal_norm": args.internal_norm,
     "split_file": args.split_file,
+    "lookahead_min": args.lookahead_min,
     "seed": args.seed,
     "load_weights": args.load_weights,
     # 数据来源 (完整快照见同目录 study_data.json)
@@ -477,7 +488,8 @@ if len(test_set) == 0:
 # 2. 构建序列数据
 # ---------------------------------------------------------------------------
 print("\n[2/5] Preparing sequence data...")
-data_loader = DataPreparation(seq_len=args.seq_len, overlap=None, causal=args.causal)
+data_loader = DataPreparation(seq_len=args.seq_len, overlap=None, causal=args.causal,
+                              lookahead=_lookahead_k)
 
 # ✅2026-08-13: --load-weights 时归一化参数 (scaler) 是模型的一部分 — 必须用 checkpoint 的
 # 配套 scaler.json, 而不是用当前 train_set 重新拟合。否则权重来自 A run、归一化来自当前
