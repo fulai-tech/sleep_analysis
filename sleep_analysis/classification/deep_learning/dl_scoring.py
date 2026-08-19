@@ -26,7 +26,7 @@ def dl_score(prediction, ground_truth, classification_type="binary", subject_id=
 def dl_score_binary(prediction, ground_truth, subject_id=None):
     prediction = _sanitize_sleep_wake_df(prediction)
 
-    print("calculation of confusion matrix", "binary classification", flush=True)
+    # ✅2026-08-19: 移除每被试调试打印 (与 multiclass 分支一致, 见 :78) — 225 个测试被试刷屏
     conf_matrix = confusion_matrix(ground_truth, prediction)
 
     scoring = {
