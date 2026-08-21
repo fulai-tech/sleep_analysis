@@ -105,6 +105,15 @@ parser.add_argument("--inv-freq", action="store_true",
 parser.add_argument("--internal-norm", action="store_true",
                     help="恢复旧版模型内部 per-batch 归一化 (08-07 前行为, 复现 08-06 基线用)。"
                          "默认关闭 (外部 scaler 作为唯一归一化)")
+# 序列级输出 (action chunking, ✅2026-08-19)
+parser.add_argument("--chunk-len", type=int, default=8,
+                    help="输出块长度 k: 模型一次输出未来 k 个 epoch 的预测 (头 0 = 窗口中心/当前帧)。"
+                         "k=1 退化为单点预测 (与历史基线 bit-exact 可比)。"
+                         "训练时每夜末尾 k-1 个窗口无完整块标签, 被截断丢弃")
+parser.add_argument("--ensemble-m", type=float, default=1.0,
+                    help="时间集成指数权重参数: w_j = exp(-m*j), j = 预测深度 (0 = 最新)。"
+                         "m=0 退化为均匀 mean log-probability (与旧评估一致)。"
+                         "推理期在 test 评估时启用 (训练/val 用第 0 头)")
 
 args = parser.parse_args()
 
@@ -136,6 +145,9 @@ if args.load_weights:
         args.inv_freq = saved_config.get("inv_freq", args.inv_freq)
         args.internal_norm = saved_config.get("internal_norm", args.internal_norm)
         args.split_file = saved_config.get("split_file", args.split_file)
+        args.chunk_len = saved_config.get("chunk_len", args.chunk_len)
+        # ✅2026-08-19: ensemble_m 是推理参数 (网格搜 m 时同一 checkpoint 要换 m 评估),
+        #   不做 config restore, 以命令行 --ensemble-m 为准
     else:
         print(f"[WARNING] {config_file} not found, using current CLI params."
               f" 确保超参数与训练时一致，否则 load_state_dict 会报错!")
@@ -152,6 +164,13 @@ if args.stateful and args.state_chunk <= 0:
     sys.exit(1)
 if args.patience < 1:
     print(f"[ERROR] --patience must be >= 1 (got {args.patience})", flush=True)
+    sys.exit(1)
+# ✅2026-08-19: chunk_len 必须 ≥ 1 (0/负数会在标签截断处出错); 校验须在 config restore 之后
+if args.chunk_len < 1:
+    print(f"[ERROR] --chunk-len must be a positive integer (got {args.chunk_len})", flush=True)
+    sys.exit(1)
+if args.ensemble_m < 0:
+    print(f"[ERROR] --ensemble-m must be >= 0 (got {args.ensemble_m})", flush=True)
     sys.exit(1)
 
 # 快速测试覆盖
@@ -311,6 +330,8 @@ config = {
     "split_file": args.split_file,
     "seed": args.seed,
     "load_weights": args.load_weights,
+    "chunk_len": args.chunk_len,
+    "ensemble_m": args.ensemble_m,
     # 数据来源 (完整快照见同目录 study_data.json)
     "data_paths": {
         "processed_mesa_path_hpc": _study_cfg.get("processed_mesa_path_hpc"),
@@ -477,7 +498,8 @@ if len(test_set) == 0:
 # 2. 构建序列数据
 # ---------------------------------------------------------------------------
 print("\n[2/5] Preparing sequence data...")
-data_loader = DataPreparation(seq_len=args.seq_len, overlap=None, causal=args.causal)
+data_loader = DataPreparation(seq_len=args.seq_len, overlap=None, causal=args.causal,
+                              chunk_len=args.chunk_len)
 
 # ✅2026-08-13: --load-weights 时归一化参数 (scaler) 是模型的一部分 — 必须用 checkpoint 的
 # 配套 scaler.json, 而不是用当前 train_set 重新拟合。否则权重来自 A run、归一化来自当前
@@ -583,11 +605,26 @@ model = LSTM(
     patience=args.patience,
     inv_freq=args.inv_freq,
     internal_norm=args.internal_norm,
+    chunk_len=args.chunk_len,
+    ensemble_m=args.ensemble_m,
 )
 
 # 加载已有权重 (如果指定)
 if args.load_weights:
     print(f"  Loading weights from: {args.load_weights}")
+    # ✅2026-08-19: 预检 fc 输出形状 — 旧 checkpoint (单头 fc (128, C)) 加载到 k>1 模型
+    # 会在 load_state_dict 抛 cryptic size mismatch; 这里给出清晰错误。
+    # 注意: config.json restore 已把 chunk_len 恢复成 checkpoint 的 (若 checkpoint 旧 run
+    # 无 chunk_len 字段则用命令行值, 此时形状校验兜底)。
+    from sleep_analysis.classification.deep_learning.utils import get_num_classes
+    _n_cls = get_num_classes(args.classification)
+    _ckpt_state = torch.load(args.load_weights, map_location="cpu")
+    _fc_w = _ckpt_state.get("fc.weight")
+    if _fc_w is not None and _fc_w.shape[0] != args.chunk_len * _n_cls:
+        print(f"[ERROR] chunk_len 不匹配: 当前 --chunk-len={args.chunk_len} 期望 fc 输出 "
+              f"{args.chunk_len * _n_cls} 维 ({_n_cls} 类), checkpoint 的 fc 输出 "
+              f"{int(_fc_w.shape[0])} 维 (旧单头 checkpoint 需 --chunk-len 1)", flush=True)
+        sys.exit(1)
     model._load_best_model_from_path(args.load_weights)
     # 配套 scaler 已在数据加载前处理 (见 [2/5] 的 companion scaler 逻辑)
 

@@ -33,7 +33,7 @@ class Attention(nn.Module):
 class Model(nn.Module):
     def __init__(
         self, num_classes, input_size, hidden_size, num_layers, dropout, use_gpu, use_attention=True,
-        dataset_name="dataset_name", modality="acc", use_internal_norm=False
+        dataset_name="dataset_name", modality="acc", use_internal_norm=False, chunk_len=1
     ):
         super(Model, self).__init__()
         torch.manual_seed(42)
@@ -45,6 +45,7 @@ class Model(nn.Module):
         torch.backends.cudnn.benchmark = False
 
         self.num_classes = num_classes
+        self.chunk_len = chunk_len  # ✅2026-08-19: action-chunking 输出块长度 (k=1 退化单点预测)
         self.num_layers = num_layers
         self.input_size = input_size
         self.dropout = dropout
@@ -62,7 +63,10 @@ class Model(nn.Module):
 
         # Fully connected layers
         self.fc_1 = nn.Linear(hidden_size, 128)
-        self.fc = nn.Linear(128, num_classes)
+        # ✅2026-08-19: 输出块长度 chunk_len —— fc 输出 k*num_classes, reshape 后为
+        #   (B, k, C), 第 0 头 = 窗口中心 (现状预测位置), 头 j = 中心后 j 步。
+        #   k=1 时形状与旧权重 (128, num_classes) 逐位兼容。
+        self.fc = nn.Linear(128, chunk_len * num_classes)
         self.dropout = nn.Dropout(self.dropout)
         self.relu = nn.ReLU()
         self.softmax = nn.Softmax(dim=1)
@@ -160,6 +164,8 @@ class Model(nn.Module):
         out = self.dropout(out)
         out = self.relu(out)
         out = self.fc(out)  # Final classification layer
+        # ✅2026-08-19: 块输出 (B, k*C) → (B, k, C)。k=1 时 reshape 不改数值 (bit-exact)。
+        out = out.reshape(-1, self.chunk_len, self.num_classes)
 
         debug_tensor(out, "Final Model Output")
 
@@ -193,7 +199,7 @@ class Model(nn.Module):
         if torch.isnan(x_t).any():
             # 镜像 forward():101-103 的 NaN 逃逸: logits 置零, 状态不推进 (数据错误, 帧对齐保持)
             print("[DEBUG] NaN detected in stateful input. Returning zero logits without advancing state.")
-            return torch.zeros(x_t.shape[0], self.num_classes, device=x_t.device), h, c, buf
+            return torch.zeros(x_t.shape[0], self.chunk_len, self.num_classes, device=x_t.device), h, c, buf
 
         lstm_out, (h_n, c_n) = self.lstm(x_t, (h, c))  # lstm_out: (B, 1, H)
 
@@ -209,6 +215,8 @@ class Model(nn.Module):
         out = self.dropout(out)
         out = self.relu(out)
         out = self.fc(out)
+        # ✅2026-08-19: 与 forward() 一致的块输出 (B, k, C); 第 0 头 = 当前帧 (窗口末尾语义)
+        out = out.reshape(-1, self.chunk_len, self.num_classes)
 
         # 滚动缓冲: 丢掉最旧的, 推入当前
         buf_out = torch.cat([buf[:, 1:, :], last_h.unsqueeze(1)], dim=1)  # (B, seq_len-1, H)

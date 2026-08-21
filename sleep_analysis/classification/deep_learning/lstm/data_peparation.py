@@ -49,10 +49,11 @@ class DataPreparation:
     :param overlap: Overlap of Sequences: Highly impacts runtime
     """
 
-    def __init__(self, seq_len, overlap, causal=False):
+    def __init__(self, seq_len, overlap, causal=False, chunk_len=1):
         self.seq_len = seq_len
         self.overlap = overlap
         self.causal = causal   # True=只在左侧padding (实时分期), False=居中padding (原文)
+        self.chunk_len = chunk_len  # ✅2026-08-19: action-chunking 输出块长度 k (k=1 退化单点)
 
     def get_sequence_data(self, features: pd.DataFrame, ground_truth: pd.DataFrame, overlap, padding=False):
         """
@@ -196,32 +197,41 @@ class DataPreparation:
                                           overlap=overlap, padding=padding)
 
         # ---- Pass 1: 统计总量 + fit scaler (不存全量数据) ----
+        # ✅2026-08-19: 块标签 y[i:i+k] 需要 i+k-1 ≤ n-1 → 每夜保留前 n-k+1 个窗口
+        #   (丢弃夜末尾 k-1 个, 不做 mask; 空洞保持删行语义, 见 preprocess_shhs.py 交集剔除)
+        def _n_keep(x_mat):
+            return max(x_mat.shape[0] - self.chunk_len + 1, 0)
+
         total_samples = 0
         if scaler is None:
             scaler = StandardScaler()
             for subj in dataset:
                 x_mat, _ = _extract_subj_features(subj)
-                total_samples += x_mat.shape[0]
+                total_samples += _n_keep(x_mat)
                 for chunk in batchify(x_mat):
                     scaler.partial_fit(chunk.reshape(-1, chunk.shape[-1]))
         else:
             for subj in dataset:
                 x_mat, _ = _extract_subj_features(subj)
-                total_samples += x_mat.shape[0]
+                total_samples += _n_keep(x_mat)
 
         # ---- Pass 2: 逐被试 scale → 直接填入预分配 tensor (不 concat) ----
         n_features = len(scaler.mean_)
         x_tensor = torch.empty(total_samples, self.seq_len, n_features, dtype=torch.float32)
-        y_tensor = torch.empty(total_samples, 1, dtype=torch.float32)
+        y_tensor = torch.empty(total_samples, self.chunk_len, dtype=torch.float32)
 
         cursor = 0
         for subj in dataset:
             x_mat, y_mat = _extract_subj_features(subj)
             x_scaled = scaler.transform(x_mat.reshape(-1, n_features)).reshape(x_mat.shape)
-            n = x_scaled.shape[0]
-            x_tensor[cursor:cursor + n] = torch.from_numpy(x_scaled.astype(np.float32))
-            y_tensor[cursor:cursor + n, 0] = torch.from_numpy(y_mat.astype(np.float32))
-            cursor += n
+            n_keep = _n_keep(x_scaled)
+            if n_keep == 0:
+                continue  # 夜长 ≤ k-1 无法构造块, 整夜跳过 (与空夜跳过语义一致)
+            x_tensor[cursor:cursor + n_keep] = torch.from_numpy(x_scaled[:n_keep].astype(np.float32))
+            # 块标签: 窗口 i (中心/末尾 = i) 输出块 [i, i+k-1] → 标签 y[i:i+k]
+            y_blocks = np.stack([y_mat[i:i + self.chunk_len] for i in range(n_keep)])
+            y_tensor[cursor:cursor + n_keep] = torch.from_numpy(y_blocks.astype(np.float32))
+            cursor += n_keep
 
         return x_tensor, y_tensor, scaler
 

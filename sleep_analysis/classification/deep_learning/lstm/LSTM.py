@@ -110,6 +110,8 @@ class LSTM:
         patience=5,
         inv_freq=False,
         internal_norm=False,
+        chunk_len=1,
+        ensemble_m=1.0,
     ):
         torch.manual_seed(seed=42)
         torch.cuda.manual_seed(seed=42)
@@ -142,6 +144,8 @@ class LSTM:
         self.patience = patience          # ✅2026-08-13: 早停耐心 (stateful 摆动周期长时可调大)
         self.inv_freq = inv_freq          # ✅2026-08-13: 类权重 1/freq (默认 1-freq)
         self.internal_norm = internal_norm  # ✅2026-08-14: 旧版内部 per-batch 归一化 (复现 08-06 基线用)
+        self.chunk_len = chunk_len        # ✅2026-08-19: action-chunking 块长度 k (k=1 退化单点)
+        self.ensemble_m = ensemble_m      # ✅2026-08-19: 时间集成指数权重参数 w_j=exp(-m*j), m=0 均匀
 
         if self.use_gpu:
             self.device = "cuda"
@@ -161,7 +165,9 @@ class LSTM:
             y_count = torch.cat([y for _, y, _ in frames_train]).squeeze()
         else:
             frames_train = frames_val = None
-            y_count = y_train
+            # ✅2026-08-19: y_train (N, k) 块标签 — 每个真实 epoch 被 k 个头重复监督,
+            #   类别比例不变, 展平统计即可 (与 k=1 行为一致)
+            y_count = y_train.reshape(-1)
 
         # load batched data
         if self.stateful:
@@ -277,11 +283,14 @@ class LSTM:
                         exit()
     
                     # obtain the loss function
+                    # ✅2026-08-19: 块输出 (B,k,C) + 块标签 (B,k) — 展平逐位置 focal loss
                     if self.classification_type == "binary":
-                        loss = criterion(outputs, y_batch_train)
+                        loss = criterion(outputs.reshape(-1, outputs.shape[-1]), y_batch_train.reshape(-1, 1))
                     else:
-                        #loss = criterion(outputs, torch.squeeze(y_batch_train).long())
-                        loss = torch.nan_to_num(criterion(outputs, y_batch_train.squeeze(1).long()), nan=0.0, posinf=1.0, neginf=-1.0)
+                        loss = torch.nan_to_num(
+                            criterion(outputs.reshape(-1, outputs.shape[-1]), y_batch_train.reshape(-1).long()),
+                            nan=0.0, posinf=1.0, neginf=-1.0,
+                        )
     
                     if torch.isnan(loss).any():
                         print("[ERROR] NaN detected in loss! Stopping training.")
@@ -337,6 +346,9 @@ class LSTM:
                     # stateful: 逐组扫描, active 帧全量拼接后统一算 loss/指标
                     with torch.no_grad():
                         logits_val, y_val_cat = self._stateful_scan(lstm, frames_val, self.device)
+                    # ✅2026-08-19: 块输出 (N,k,C) — stateful 本轮最小适配: 取第 0 头 (当前帧),
+                    #   行为与改造前单头一致 (stateful 完整序列化下一轮做)
+                    logits_val = logits_val[:, 0]
                     if self.classification_type == "binary":
                         val_loss = criterion_none(logits_val, y_val_cat.unsqueeze(-1)).squeeze(-1).mean()
                     else:
@@ -355,18 +367,20 @@ class LSTM:
                         y_batch_val = y_batch_val.to(self.device)
 
                         with torch.no_grad():
-                            y_pred = lstm.forward(x_batch_val)
+                            y_pred = lstm.forward(x_batch_val)  # (B, k, C)
 
-                        # calculate loss of batch-wise prediction
+                        # calculate loss of batch-wise prediction (全头逐位置, 与训练一致)
                         if self.classification_type == "binary":
-                            val_loss = criterion(y_pred, y_batch_val)
+                            val_loss = criterion(y_pred.reshape(-1, y_pred.shape[-1]), y_batch_val.reshape(-1, 1))
                         else:
-                            val_loss = criterion(y_pred, y_batch_val.squeeze(1).long())
+                            val_loss = criterion(y_pred.reshape(-1, y_pred.shape[-1]), y_batch_val.reshape(-1).long())
 
                         val_losses.append(val_loss.item())
 
-                        # calculate metrics
-                        class_performance = tensor_to_performance(y_batch_val, y_pred, self.classification_type)
+                        # ✅2026-08-19: 指标用第 0 头 (窗口中心 = 现状预测位置) — checkpoint 选择口径
+                        class_performance = tensor_to_performance(
+                            y_batch_val[:, 0:1], y_pred[:, 0], self.classification_type
+                        )
                         val_mccs.append(class_performance["mcc"])
                         val_accs.append(class_performance["accuracy"])
                         val_kappas.append(class_performance["kappa"])
@@ -398,7 +412,10 @@ class LSTM:
                                 warnings.simplefilter("ignore")
                                 with torch.no_grad():
                                     logits_src, y_src = self._stateful_scan(lstm, src_data, self.device)
-                                    perf = tensor_to_performance(y_src.unsqueeze(1), logits_src, self.classification_type)
+                                    # ✅2026-08-19: 块输出取第 0 头 (stateful 最小适配)
+                                    perf = tensor_to_performance(
+                                        y_src.unsqueeze(1), logits_src[:, 0], self.classification_type
+                                    )
                             src_accs.append(perf['accuracy'])
                             src_kappas.append(perf['kappa'])
                             src_mccs.append(perf['mcc'])
@@ -415,8 +432,9 @@ class LSTM:
                                 for xb, yb in zip(*self.batch_loader(xs, ys)):
                                     xb, yb = xb.to(self.device), yb.to(self.device)
                                     with torch.no_grad():
-                                        yp = lstm.forward(xb)
-                                        perf = tensor_to_performance(yb, yp, self.classification_type)
+                                        yp = lstm.forward(xb)  # (B, k, C)
+                                        # ✅2026-08-19: 指标用第 0 头 (与主 val 口径一致)
+                                        perf = tensor_to_performance(yb[:, 0:1], yp[:, 0], self.classification_type)
                                     src_accs.append(perf['accuracy'])
                                     src_kappas.append(perf['kappa'])
                                     src_mccs.append(perf['mcc'])
@@ -518,6 +536,8 @@ class LSTM:
                         logits_list.append(out)
                     y_pred = torch.cat(logits_list).to(device="cpu")
                 y_pred = y_pred.detach().numpy()
+                # ✅2026-08-19: stateful 本轮最小适配 — 块输出取第 0 头 (当前帧), 行为同改造前
+                y_pred = y_pred[:, 0]
 
                 # move ground truth data to cpu and convert to numpy array
                 y_batch_test = y_s.cpu()
@@ -552,18 +572,23 @@ class LSTM:
 
                 # apply model to test data and move to cpu and convert to numpy array
                 with torch.no_grad():
-                    y_pred = lstm.forward(x_batch_test).to(device="cpu")
-                y_pred = y_pred.detach().numpy()
+                    blocks = lstm.forward(x_batch_test).to(device="cpu")
+                blocks = blocks.detach().numpy()  # (W, k, C) — 每窗口一个块
+
+                # ✅2026-08-19: 时间集成 — 对每个 epoch t, 加权合并窗口 [t-k+1, t] 的
+                #   k 个深度预测 (log 域, w_j = exp(-m*j)); m=0 退化为均匀 mean log-prob
+                scores = self._ensemble_chunked(blocks, self.ensemble_m)  # (W, C)
 
                 # move ground truth data to cpu and convert to numpy array
-                y_batch_test = y_batch_test[0].cpu()
-                y_batch_test = pd.DataFrame(y_batch_test.detach().numpy(), columns=["sleep_stage"])
+                # 块 [i, i+k-1] 第 0 头 = epoch i → 评估用第 0 列 (与夜末尾截断对齐)
+                y_batch_test = y_batch_test[0].cpu().detach().numpy()
+                y_batch_test = pd.DataFrame(y_batch_test[:, 0], columns=["sleep_stage"])
 
                 # determine prediction based on classification type
                 if self.classification_type == "binary":
-                    y_pred = (1 / (1 + np.exp(-y_pred)) >= 0.5).astype(float)
+                    y_pred = (1 / (1 + np.exp(-scores)) >= 0.5).astype(float)
                 else:
-                    y_pred = np.argmax(y_pred, axis=1)
+                    y_pred = np.argmax(scores, axis=1)
 
                 # save predictions in dictionary
                 pred_dict[subj_idx] = y_pred
@@ -585,6 +610,43 @@ class LSTM:
         score_mean = subject_results.loc[numeric_cols].agg(["mean"], axis=1).T
 
         return subject_results, score_mean, pred_dict
+
+    def _ensemble_chunked(self, blocks, m):
+        """✅2026-08-19: 块级时间集成 (ACT temporal ensembling 的睡眠分期移植)。
+
+        :param blocks: 每窗口的块 logits, (W, k, C) float32 numpy
+        :param m: 指数权重参数 w_j = exp(-m*j), j = 预测深度 (j=0 = 窗口中心/最新)
+        :return: (W, C) 集成后分数
+
+        对 epoch t, 预测来自窗口 w ∈ [max(0, t-k+1), t], 深度 j = t-w。
+        - multi 类: log 域加权 (log_softmax 后加权平均 = 概率几何平均 = 乘性共识);
+          log_softmax clamp(-100) 防极端 logits 产生 -inf → 0*-inf=NaN。
+        - binary: 对 logits 加权平均 (几何 odds 平均, 与 log 域一致)。
+        - m=0 → 均匀平均 (= 现状 mean log-probability); k=1 → 退化为无操作。
+        - 夜末尾 epoch (t > W-k) 有效窗口数 < k, 只平均存在的 (除数按实际窗口数)。
+        """
+        W, k, C = blocks.shape
+        if k == 1:
+            return blocks[:, 0]
+        weights = np.exp(-m * np.arange(k))  # (k,) — 深度 j 的权重, j=0 最新最可信
+        scores = np.zeros((W, C), dtype=np.float32)
+        for t in range(W):
+            w_start = max(0, t - k + 1)
+            ws = np.arange(w_start, t + 1)          # 覆盖 epoch t 的窗口
+            js = t - ws                             # 各窗口的深度 j = t - w
+            wsel = weights[js]
+            wsum = wsel.sum()
+            # 成对索引: 窗口 w 取块深度 (t-w) — 每个窗口的深度随 w 变化
+            sel = blocks[ws, js, :]                 # (n_w, C)
+            if C == 1:
+                scores[t] = (wsel[:, None] * sel).sum(axis=0) / wsum
+            else:
+                log_p = sel.astype(np.float64)
+                mx = log_p.max(axis=-1, keepdims=True)
+                log_p = log_p - mx - np.log(np.exp(log_p - mx).sum(axis=-1, keepdims=True))
+                log_p = np.clip(log_p, -100.0, None)
+                scores[t] = (wsel[:, None] * log_p).sum(axis=0) / wsum
+        return scores
 
     # ------------------------------------------------------------------
     # stateful 辅助 (✅2026-08-11 - rdwang: 逐帧扫描 + truncated BPTT)
@@ -645,7 +707,10 @@ class LSTM:
         for t in range(x_chunk.shape[0]):
             outputs, h, c, buf = lstm.forward_stateful(x_chunk[t], h, c, buf)
             logits_list.append(outputs)
-        outputs = torch.stack(logits_list).clamp(min=-10, max=10)  # (C, P, C_out)
+        outputs = torch.stack(logits_list).clamp(min=-10, max=10)  # (C, P, k, C_out)
+        # ✅2026-08-19: stateful 本轮最小适配 — 取第 0 头 (当前帧), 行为同改造前
+        #   (stateful 块标签/完整序列化下一轮做)
+        outputs = outputs[:, :, 0]  # (C, P, C_out)
 
         optimizer.zero_grad()
 
@@ -761,4 +826,5 @@ class LSTM:
             modality=self.modality,
             use_attention=use_attention,
             use_internal_norm=self.internal_norm,
+            chunk_len=self.chunk_len,  # ✅2026-08-19: action-chunking 块长度
         )
