@@ -288,7 +288,11 @@ def process_one_subject(cfg):
                 e.iloc[:ml].reset_index(drop=True),
             ], axis=1)
             combined = combined.loc[:, ~combined.columns.duplicated()]
-            combined.to_csv(out_merge, index=False)
+            # 20260821: 与 MESA merge_features 的约定一致 — 写入带 RangeIndex 首列,
+            # 训练端 (ShhsDataset.feature_table / inference data_utils) 统一用
+            # index_col=0 消费该列。原 index=False 会把首个特征列 (_hrv_mean_nni)
+            # 在读取时被 index_col=0 吞成索引, 特征静默缺失。
+            combined.to_csv(out_merge, index=True)
         timings["merge"] = time.time() - t4
 
         elapsed = time.time() - t0
