@@ -112,55 +112,34 @@ class DataPreparation:
 
         return x_normalized, scaler
 
-    def _extract_subj_features_raw(self, subj, dataset_cls_name, modality, classification_type="binary"):
+    def _extract_subj_features_raw(self, subj, dataset, modality, classification_type="binary"):
         """按 modality 选择特征列并返回 (features_df, ground_truth_df)。
 
         ✅2026-08-11 - rdwang: 从 get_data 闭包中抽出, 供 get_data (窗口) 与
         get_frame_data (stateful 帧) 共用, 保证两路径特征选择完全一致。
-        :param dataset_cls_name: 数据集类名 (dataset.__class__.__name__), 与原闭包
-            的检查对象一致 (MixedDataset 元素类名可能不同于 dataset 类名, 不能改用 subj)。
+        ✅20260822 - rdwang: 特征列选择改为数据集类的 feature_columns 策略
+        (原类名白名单) — 新增数据集只需在数据集类里声明 FEATURE_COLUMNS,
+        不再需要改这里。dataset 传入外层数据集实例 (不传 subj, 因 MixedDataset
+        子集类名不可靠)。
         """
+        fc = getattr(dataset, "feature_columns", None)
+        if fc is None:
+            raise AttributeError(
+                f"Dataset not known: {dataset.__class__.__name__} (缺少 feature_columns 策略)")
         features = pd.DataFrame()
         all_features = subj.feature_table
 
         if "ACT" in modality:
-            movement_features = all_features.filter(regex="_acc")[
-                ["_acc_mean_1"]
-            ]
+            movement_features = all_features.filter(regex="_acc")[fc("ACT")]
             features = pd.concat([features, movement_features], axis=1)
         if "HRV" in modality:
-            if dataset_cls_name == "D04MainStudy":
-                hrv_features = all_features.filter(regex="_hrv")[
-                    [
-                        "30_hrv_median_nni", "30_hrv_ratio_sd2_sd1",
-                        "150_hrv_median_nni", "150_hrv_vlf",
-                        "150_hrv_lf", "150_hrv_hf",
-                        "150_hrv_lf_hf_ratio", "150_hrv_total_power",
-                    ]
-                ]
-            elif dataset_cls_name in ("MesaDataset", "ShhsDataset", "MixedDataset"):
-                hrv_features = all_features.filter(regex="_hrv")[
-                    [
-                        "_hrv_median_nni", "_hrv_ratio_sd2_sd1",
-                        "_hrv_median_nni",
-                        "_hrv_vlf", "_hrv_lf", "_hrv_hf",
-                        "_hrv_lf_hf_ratio", "_hrv_total_power",
-                    ]
-                ]
-            else:
-                raise AttributeError("Dataset not known")
+            hrv_features = all_features.filter(regex="_hrv")[fc("HRV")]
             features = pd.concat([features, hrv_features], axis=1)
         if "RRV" in modality:
-            rrv_features = all_features.filter(regex="RRV")[
-                ["150_RRV_MedianBB", "150_RRV_LF",
-                 "270_RRV_MCVBB", "150_RRV_CVBB"]
-            ]
+            rrv_features = all_features.filter(regex="RRV")[fc("RRV")]
             features = pd.concat([features, rrv_features], axis=1)
         if "EDR" in modality:
-            edr_features = all_features.filter(regex="EDR")[
-                ["150_EDR_MeanBB", "150_EDR_LF",
-                 "150_EDR_HF", "150_EDR_LFHF"]
-            ]
+            edr_features = all_features.filter(regex="EDR")[fc("EDR")]
             features = pd.concat([features, edr_features], axis=1)
 
         if classification_type == "binary":
@@ -190,7 +169,7 @@ class DataPreparation:
         # ---- 特征提取辅助函数 ----
         def _extract_subj_features(subj):
             features, ground_truth = self._extract_subj_features_raw(
-                subj, dataset.__class__.__name__, modality, classification_type
+                subj, dataset, modality, classification_type
             )
             return self.get_sequence_data(features, ground_truth,
                                           overlap=overlap, padding=padding)
@@ -235,11 +214,10 @@ class DataPreparation:
         若在帧上重拟合, 与 stateless 的缩放不一致, 会破坏 stateless↔stateful 可比性
         与 --load-weights 微调无状态 checkpoint 的兼容性。
         """
-        dataset_cls_name = dataset.__class__.__name__
         frames = []
         for subj in dataset:
             features, ground_truth = self._extract_subj_features_raw(
-                subj, dataset_cls_name, modality, classification_type
+                subj, dataset, modality, classification_type
             )
             feature_arr = np.asarray(features)
             gt_arr = np.asarray(ground_truth)

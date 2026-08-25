@@ -47,9 +47,9 @@ from sleep_analysis.classification.deep_learning.lstm.data_peparation import Dat
 from sleep_analysis.classification.deep_learning.lstm.LSTM import LSTM
 from sleep_analysis.classification.deep_learning.utils import get_num_input
 from sleep_analysis.datasets.helper import get_random_split
-from sleep_analysis.datasets.mesadataset import MesaDataset
-from sleep_analysis.datasets.shhs_dataset import ShhsDataset
 from sleep_analysis.datasets.mixed_dataset import MixedDataset
+from sleep_analysis.datasets.registry import get_dataset, get_dataset_class
+# import sleep_analysis.datasets 由上面的 registry 导入隐式触发 (__init__ 目录加载各数据集自注册)
 
 # ---------------------------------------------------------------------------
 # 命令行参数
@@ -163,46 +163,55 @@ if args.small:
 # 数据集创建
 # ---------------------------------------------------------------------------
 DATASET_PARTS = args.dataset.split("+")
-_DS_REGISTRY = {
-    "MESA_Sleep": lambda: MesaDataset(),
-    "SHHS1": lambda: ShhsDataset(study="shhs1"),
-    "SHHS2": lambda: ShhsDataset(study="shhs2"),
-}
 
-# 按数据集默认选 modality
-has_mesa = any(not p.startswith("SHHS") for p in DATASET_PARTS)
-has_shhs = any(p.startswith("SHHS") for p in DATASET_PARTS)
+# ✅20260822: 模态默认值改为读数据集类的自描述属性 (modality_defaults /
+# has_actigraphy), 不再按前缀猜 — 新增数据集零改动。
+# 规则: 各数据集默认模态取并集; 任一数据集无体动 → 剔除 ACT。
+_has_actigraphy_all = True
+_default_modality = []
+for _p in DATASET_PARTS:
+    _cls = get_dataset_class(_p)
+    _has_actigraphy_all &= _cls.has_actigraphy
+    for _m in _cls.modality_defaults:
+        if _m not in _default_modality:
+            _default_modality.append(_m)
 if args.modality is not None:
-    if has_shhs and "ACT" in args.modality:
+    if not _has_actigraphy_all and "ACT" in args.modality:
         print("[WARNING] Some datasets have no actigraphy. Removing ACT from modality.")
         args.modality = [m for m in args.modality if m != "ACT"]
 else:
-    if has_mesa and has_shhs:
-        args.modality = ["HRV", "RRV"]
-    elif has_shhs:
-        args.modality = ["HRV", "RRV"]
-    else:
-        args.modality = ["ACT", "HRV", "RRV"]
+    args.modality = [m for m in _default_modality if m != "ACT"] if not _has_actigraphy_all else _default_modality
 
 # 对每个子数据集分别 80/20 划分，再拼成 train/val/test
-# SHHS1/SHHS2 共享参与者：先按 nsrrid 联合划分，避免同一人被分到训练集和测试集
+# ✅20260822: 共享被试身份的数据集组 (person_pool 相同, 如 SHHS1/SHHS2 共享
+# nsrrid) 先按人员 ID 联合划分, 避免同一人被分到训练集和测试集 — 由数据集类
+# 的 person_pool 钩子驱动, 不再硬编码前缀。
 _singleton = len(DATASET_PARTS) == 1
 _train_sources, _val_sources, _test_sources = {}, {}, {}
-_shhs_datasets = [p for p in DATASET_PARTS if p.startswith("SHHS")]
-if len(_shhs_datasets) > 1:
-    # 收集所有 SHHS 子集的 nsrrid (SHHS 的 subj_id 就是 nsrrid)
-    _shhs_pids = set()
-    _shhs_ds_map = {}
-    for name in _shhs_datasets:
-        ds = _DS_REGISTRY[name]()
+_joint_done = set()
+
+# 按 person_pool 分组: 同池数据集做联合人员级划分
+_pools = {}
+for _name in DATASET_PARTS:
+    _pool = get_dataset_class(_name).person_pool or _name.lower()
+    _pools.setdefault(_pool, []).append(_name)
+
+for _pool, _names in _pools.items():
+    if len(_names) < 2:
+        continue
+    # 收集该池所有数据集的被试身份 (如 SHHS 的 subj_id 就是 nsrrid)
+    _pool_pids = set()
+    _pool_ds_map = {}
+    for _name in _names:
+        ds = get_dataset(_name)
         if args.small:
             ds = ds[0:20]
-        key = name.lower().replace("_", "")
-        _shhs_ds_map[key] = ds
-        _shhs_pids.update(ds.index["subj_id"].tolist())
+        key = _name.lower().replace("_", "")
+        _pool_ds_map[key] = ds
+        _pool_pids.update(ds.index["subj_id"].tolist())
 
     # 按参与者 ID 划分 (80/20 → 80/20)
-    _pids_sorted = sorted(_shhs_pids)
+    _pids_sorted = sorted(_pool_pids)
     np.random.seed(args.seed)
     np.random.shuffle(_pids_sorted)
     n_test = max(1, int(len(_pids_sorted) * 0.2))
@@ -212,39 +221,33 @@ if len(_shhs_datasets) > 1:
     _val_pids_set = set(_trainval_list[:n_val])
     _train_pids = set(_trainval_list[n_val:])
 
-    print(f"[MIXED] SHHS participant-level split: "
+    print(f"[MIXED] {_pool} participant-level split: "
           f"train={len(_train_pids)}, val={len(_val_pids_set)}, test={len(_test_pids)}")
     # 防御：确保 train/val/test 无被试重叠
-    assert _train_pids.isdisjoint(_val_pids_set), "SHHS train/val overlap detected!"
-    assert _train_pids.isdisjoint(_test_pids), "SHHS train/test overlap detected!"
-    assert _val_pids_set.isdisjoint(_test_pids), "SHHS val/test overlap detected!"
+    assert _train_pids.isdisjoint(_val_pids_set), f"{_pool} train/val overlap detected!"
+    assert _train_pids.isdisjoint(_test_pids), f"{_pool} train/test overlap detected!"
+    assert _val_pids_set.isdisjoint(_test_pids), f"{_pool} val/test overlap detected!"
 
-    for key, ds in _shhs_ds_map.items():
+    for key, ds in _pool_ds_map.items():
         train_idx = [i for i, sid in enumerate(ds.index["subj_id"]) if sid in _train_pids]
         val_idx = [i for i, sid in enumerate(ds.index["subj_id"]) if sid in _val_pids_set]
         test_idx = [i for i, sid in enumerate(ds.index["subj_id"]) if sid in _test_pids]
         _train_sources[key] = ds[train_idx] if train_idx else ds[0:0]
         _val_sources[key] = ds[val_idx] if val_idx else ds[0:0]
         _test_sources[key] = ds[test_idx] if test_idx else ds[0:0]
+    _joint_done.update(_names)
 
-# 非 SHHS (MESA) 独立划分
-for name in [p for p in DATASET_PARTS if p not in _shhs_datasets or len(_shhs_datasets) <= 1]:
-    if name not in _DS_REGISTRY:
-        raise ValueError(f"Unknown dataset: {name}")
-    ds = _DS_REGISTRY[name]()
+# 其余数据集 (独立池) 各自随机划分
+for name in [p for p in DATASET_PARTS if p not in _joint_done]:
+    ds = get_dataset(name)
     if args.small:
         ds = ds[0:20]
     if _singleton:
         dataset = ds
     else:
         key = name.lower().replace("_", "")
-        if name.startswith("SHHS"):
-            # 单 SHHS 数据集 (len(_shhs_datasets)<=1)：用标准随机划分
-            src_train, src_test = get_random_split(ds)
-            src_train, src_val = get_random_split(src_train)
-        else:
-            src_train, src_test = get_random_split(ds)
-            src_train, src_val = get_random_split(src_train)
+        src_train, src_test = get_random_split(ds)
+        src_train, src_val = get_random_split(src_train)
         _train_sources[key] = src_train
         _val_sources[key] = src_val
         _test_sources[key] = src_test
@@ -256,20 +259,20 @@ if not _singleton:
     print(f"[MIXED] {', '.join(DATASET_PARTS)}: "
           f"train={len(train_set)}, val={len(val_set)}, test={len(test_set)}")
 
-    # 最终检查：SHHS1+SHHS2 的 train/val/test 在被试级无重叠
-    if len(_shhs_datasets) > 1:
+    # 最终检查：联合划分池 (如 SHHS1+SHHS2) 的 train/val/test 在被试级无重叠
+    if _joint_done:
         def _de_prefix(ids):
-            """从 shhs1@201206 → 201206 提取原始 nsrrid"""
+            """从 shhs1@201206 → 201206 提取原始被试 ID"""
             return {str(s).split("@", 1)[-1] for s in ids}
         train_ids = _de_prefix(train_set.index["subj_id"])
         val_ids = _de_prefix(val_set.index["subj_id"])
         test_ids = _de_prefix(test_set.index["subj_id"])
         assert train_ids.isdisjoint(val_ids), \
-            f"SHHS train/val overlap in final split! {len(train_ids & val_ids)} subjects"
+            f"train/val overlap in final split! {len(train_ids & val_ids)} subjects"
         assert train_ids.isdisjoint(test_ids), \
-            f"SHHS train/test overlap in final split! {len(train_ids & test_ids)} subjects"
+            f"train/test overlap in final split! {len(train_ids & test_ids)} subjects"
         assert val_ids.isdisjoint(test_ids), \
-            f"SHHS val/test overlap in final split! {len(val_ids & test_ids)} subjects"
+            f"val/test overlap in final split! {len(val_ids & test_ids)} subjects"
 
 # ---------------------------------------------------------------------------
 # 输出目录 & 配置保存
@@ -382,7 +385,7 @@ if args.split_file is not None:
                 if _src_key not in _src_name_map:
                     print(f"[WARNING] split 名单中的数据集 {_src_key} 不在本次训练数据集内, 跳过")
                     continue
-                ds = _DS_REGISTRY[_src_name_map[_src_key]]()
+                ds = get_dataset(_src_name_map[_src_key])
                 if args.small:
                     # ✅2026-08-13: 与其他分支一致 — split-file 混合模式此前漏掉 --small 切片,
                     # 导致 smoke 跑在全量数据上

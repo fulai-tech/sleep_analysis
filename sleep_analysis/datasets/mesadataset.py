@@ -1,28 +1,37 @@
 import json
 import re
 from pathlib import Path
+from typing import Optional
 
 import pandas as pd
-from tpcp import Dataset
 
+from sleep_analysis.datasets.base_sleep_dataset import BaseSleepDataset
 from sleep_analysis.datasets.helper import build_base_path_processed_mesa
+from sleep_analysis.datasets.registry import register
 
 
-class MesaDataset(Dataset):
+@register("MESA_Sleep")
+class MesaDataset(BaseSleepDataset):
     """
     Dataset class for the MESA dataset created according to the tpcp framework (https://github.com/mad-lab-fau/tpcp)
+
+    20260822: 改为继承 BaseSleepDataset — ID 提取/模态默认值/特征列选择走基类钩子,
+    新增数据集不再需要改训练管线。
     """
 
-    def create_index(self):
-        path = build_base_path_processed_mesa()
+    id_pattern = r"(\d{4})\.csv"
+    has_actigraphy = True
+    person_pool = "mesa"
+    modality_defaults = ["ACT", "HRV", "RRV"]
 
-        path = path.joinpath("features_full_combined").resolve()
-        path_list = list(Path(path).glob("*.csv"))
-        # 20260805: 与 merge_features 同样的修复 — 只从文件名提取 ID,
-        # 避免路径中的日期数字 (如 processed_data_no_leak_20260805 的 2026/0805)
-        # 被当成伪被试 ID (会读取不存在的 features_combined2026.csv 崩溃)
-        subj_id = [re.findall(r"(\d{4})\.csv", f.name)[0] for f in path_list]
-        return pd.DataFrame(subj_id, columns=["subj_id"])
+    def __init__(self, *, processed_path: Optional[Path] = None,
+                 groupby_cols=None, subset_index=None, **kwargs):
+        # 注意: 已是 Path 的对象原样存储 — tpcp 克隆校验要求 getattr 返回的
+        # 参数与构造器入参是同一对象 (Path(p) 会新建对象导致 clone 报错)
+        self.processed_path = (processed_path if isinstance(processed_path, Path)
+                               else Path(processed_path)) if processed_path is not None \
+            else build_base_path_processed_mesa()
+        super().__init__(groupby_cols=groupby_cols, subset_index=subset_index, **kwargs)
 
     @property
     def actigraph_data(self):

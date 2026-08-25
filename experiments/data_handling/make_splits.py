@@ -19,26 +19,17 @@
 
 import argparse
 import json
-import re
 from pathlib import Path
 
 import numpy as np
 
 import sleep_analysis.processing_config as pc  # noqa: F401  (确保包可导入)
+# import sleep_analysis.datasets 触发数据集自注册 (经 registry 导入隐式触发)
 
 
-def _ids_from_features(dir_path: Path) -> list:
-    """从 features_full_combined 文件列表提取被试 ID (与各 Dataset.create_index 一致)。"""
-    feat_dir = Path(dir_path) / "features_full_combined"
-    if not feat_dir.exists():
-        raise FileNotFoundError(f"features_full_combined 不存在: {feat_dir}")
-    ids = []
-    for f in sorted(feat_dir.glob("features_combined*.csv")):
-        # MESA: 4 位数字; SHHS: 6 位数字
-        m = re.findall(r"(\d{4,6})\.csv", f.name)
-        if m:
-            ids.append(m[0])
-    return ids
+def _ids_from_dataset(ds) -> list:
+    """从数据集类的 index 提取被试 ID (create_index 的 ID 提取逻辑由数据集类自己声明)。"""
+    return [str(s) for s in ds.index["subj_id"]]
 
 
 def split_shhs_joint(shhs1_ids: list, shhs2_ids: list, seed: int = 42):
@@ -80,12 +71,12 @@ def main():
     args = parser.parse_args()
 
     cfg = json.load(open("study_data.json"))
-    shhs1_dir = args.shhs1_path or Path(cfg["shhs1_processed_path"])
-    shhs2_dir = args.shhs2_path or Path(cfg["shhs2_processed_path"])
+    from sleep_analysis.datasets.mesadataset import MesaDataset
+    from sleep_analysis.datasets.shhs_dataset import ShhsDataset
 
     # MESA: 复用现有 split 名单
     mesa_split = json.load(open(args.mesa_split))
-    mesa_ids = _ids_from_features(Path(cfg["processed_mesa_path"]))
+    mesa_ids = _ids_from_dataset(MesaDataset())
     mesa_part = {
         k: [i for i in mesa_ids if i in set(v)] for k, v in mesa_split.items()
     }
@@ -93,8 +84,8 @@ def main():
           f"val={len(mesa_part['val'])} test={len(mesa_part['test'])}")
 
     # SHHS1/SHHS2: 联合划分 (复现自动划分逻辑)
-    shhs1_ids = _ids_from_features(shhs1_dir)
-    shhs2_ids = _ids_from_features(shhs2_dir)
+    shhs1_ids = _ids_from_dataset(ShhsDataset(study="shhs1", processed_path=args.shhs1_path))
+    shhs2_ids = _ids_from_dataset(ShhsDataset(study="shhs2", processed_path=args.shhs2_path))
     print(f"SHHS1: {len(shhs1_ids)} 被试 | SHHS2: {len(shhs2_ids)} 被试")
     shhs1_part, shhs2_part, n_tr, n_va, n_te = split_shhs_joint(shhs1_ids, shhs2_ids)
     print(f"SHHS 联合划分: train={n_tr} val={n_va} test={n_te} (nsrrid 级别, 无跨集重叠)")

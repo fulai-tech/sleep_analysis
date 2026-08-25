@@ -13,6 +13,7 @@ from empkins_io.sync import SyncedDataset
 from tpcp import Dataset
 import platform
 
+from sleep_analysis.datasets.base_sleep_dataset import BaseSleepDataset
 from sleep_analysis.datasets.helper import (
     _build_base_path,
     _load_radar_data,
@@ -26,6 +27,26 @@ _cached_load_radar_data = lru_cache(maxsize=4)(_load_radar_data)
 
 
 class D04MainStudy(Dataset):
+    """EmpkinS D04 雷达数据集。
+
+    20260822: 增加 feature_columns 策略 (特征列名与 MESA/SHHS 不同 — 30_/150_ 前缀),
+    供 data_peparation 的特征选择统一走数据集自描述接口。
+    """
+
+    # D04 的 HRV 特征列名带窗口前缀 (30_/150_), 与 BaseSleepDataset 默认不同
+    FEATURE_COLUMNS = {
+        "ACT": ["_acc_mean_1"],
+        "HRV": ["30_hrv_median_nni", "30_hrv_ratio_sd2_sd1", "150_hrv_median_nni",
+                "150_hrv_vlf", "150_hrv_lf", "150_hrv_hf",
+                "150_hrv_lf_hf_ratio", "150_hrv_total_power"],
+        "RRV": ["150_RRV_MedianBB", "150_RRV_LF", "270_RRV_MCVBB", "150_RRV_CVBB"],
+        "EDR": ["150_EDR_MeanBB", "150_EDR_LF", "150_EDR_HF", "150_EDR_LFHF"],
+    }
+
+    @classmethod
+    def feature_columns(cls, modality: str):
+        return cls.FEATURE_COLUMNS.get(modality)
+
     use_cache: bool
     exclusion_criteria: list
     classification: str

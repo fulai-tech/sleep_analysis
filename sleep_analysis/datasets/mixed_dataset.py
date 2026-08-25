@@ -15,6 +15,8 @@
 import pandas as pd
 from tpcp import Dataset
 
+from sleep_analysis.datasets.base_sleep_dataset import BaseSleepDataset
+
 
 class MixedDataset(Dataset):
     """合并多个同构 tpcp Dataset。
@@ -22,6 +24,12 @@ class MixedDataset(Dataset):
     每个源 dataset 的 index 中自动加 _source 列标记来源。
     迭代 / 切片 / 属性访问时根据 _source 转发到正确的底层 dataset。
     """
+
+    # 20260822: 特征列选择走数据集自描述接口 — MixedDataset 使用标准命名约定
+    # (与历史行为一致: 混合集统一按 MESA/SHHS 的列名选择)
+    @classmethod
+    def feature_columns(cls, modality: str):
+        return BaseSleepDataset.FEATURE_COLUMNS.get(modality)
 
     def __init__(self, sources, *, groupby_cols=None, subset_index=None, **kwargs):
         """
