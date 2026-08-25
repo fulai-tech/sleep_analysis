@@ -538,6 +538,7 @@ class LSTM:
                 y_pred = y_pred.detach().numpy()
                 # ✅2026-08-19: stateful 本轮最小适配 — 块输出取第 0 头 (当前帧), 行为同改造前
                 y_pred = y_pred[:, 0]
+                y_pred_logits = y_pred  # (n, C) 第 0 头分数 — 保存供多模型投票
 
                 # move ground truth data to cpu and convert to numpy array
                 y_batch_test = y_s.cpu()
@@ -556,6 +557,15 @@ class LSTM:
                 subj_pred_dir = self.output_dir / "per_subject_predictions"
                 subj_pred_dir.mkdir(parents=True, exist_ok=True)
                 pd.DataFrame(y_pred).to_csv(subj_pred_dir / f"{subj_idx}.csv")
+                # ✅2026-08-20: 保存集成后 logits + 真实标签 — 多模型 log 域加权投票的输入
+                #   header=False + index=False: 纯数据文件 (投票脚本 header=None 读回,
+                #   否则 header 行会被当成第一个 epoch 的数据, 整体错位一行)
+                #   float_format="%.9g": float32 保真 (默认精度丢尾数 → 边界 argmax 翻转)
+                pd.DataFrame(y_pred_logits).to_csv(subj_pred_dir / f"{subj_idx}_logits.csv",
+                                                   index=False, header=False, float_format="%.9g")
+                pd.DataFrame(y_batch_test["sleep_stage"].values).to_csv(
+                    subj_pred_dir / f"{subj_idx}_labels.csv", index=False, header=False
+                )
 
                 # calculate classification performance for each subject
                 subj_score = dl_score(
@@ -592,6 +602,19 @@ class LSTM:
 
                 # save predictions in dictionary
                 pred_dict[subj_idx] = y_pred
+
+                # ✅2026-08-20: 保存集成后 logits + 真实标签 — 多模型 log 域加权投票的输入
+                #   header=False + index=False: 纯数据文件 (投票脚本 header=None 读回,
+                #   否则 header 行会被当成第一个 epoch 的数据, 整体错位一行)
+                #   float_format="%.9g": float32 有 ~7.2 位十进制有效数字, 9 位保真
+                #   (默认精度会丢 logits 尾数, 边界样本 argmax 翻转 → 投票结果偏差)
+                subj_pred_dir = self.output_dir / "per_subject_predictions"
+                subj_pred_dir.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(scores).to_csv(subj_pred_dir / f"{subj_idx}_logits.csv",
+                                            index=False, header=False, float_format="%.9g")
+                pd.DataFrame(y_batch_test["sleep_stage"].values).to_csv(
+                    subj_pred_dir / f"{subj_idx}_labels.csv", index=False, header=False
+                )
 
                 # safe sleep stage predictions with subject id to csv file for subsequent analysis
                 subj_pred_dir = self.output_dir / "per_subject_predictions"
