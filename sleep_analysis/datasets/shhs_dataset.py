@@ -8,6 +8,8 @@ from typing import List, Optional, Union
 import pandas as pd
 from tpcp import Dataset
 
+from sleep_analysis.datasets.helper import ordered_glob_csv
+
 
 def _get_shhs_config(study: str):
     """读取 study_data.json 中与指定 SHHS 子集相关的路径。"""
@@ -48,7 +50,8 @@ class ShhsDataset(Dataset):
 
     def create_index(self):
         path = self._config["processed_path"] / "features_full_combined"
-        path_list = list(path.glob("*.csv"))
+        # ✅2026-08-27: 确定性顺序 — sorted, 或 SLEEP_ORDER_MANIFEST 清单序 (精确复现历史 run)
+        path_list = ordered_glob_csv(path, r"(\d{6})\.csv")
         # SHHS ID 为 6 位数字
         # 20260805: 与 merge_features 同样的修复 — 只从文件名提取 ID,
         # 避免路径中的日期数字被当成伪被试 ID

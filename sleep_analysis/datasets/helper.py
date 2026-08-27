@@ -1,4 +1,6 @@
 import json
+import os
+import re
 from pathlib import Path
 import platform
 
@@ -6,6 +8,32 @@ import pandas as pd
 import pytz
 from empkins_io.sensors.emrad import EmradDataset
 from sklearn.model_selection import train_test_split
+
+
+def ordered_glob_csv(path: Path, id_pattern: str, manifest_env: str = "SLEEP_ORDER_MANIFEST"):
+    """glob 特征 CSV 并按确定顺序返回文件列表。
+
+    ✅2026-08-27 修复: Path.glob 不排序 → 被试顺序 = 文件系统目录序,
+    跨机器不一致 (目录序不同 → batch 组成不同 → 同参数训练结果分叉,
+    见 2026-08-17 run 在 212 与本机复现差异)。
+    - 默认: sorted(glob) — 跨机器确定性可复现。
+    - 可选: 设置 SLEEP_ORDER_MANIFEST=<每行一个被试 ID 的文件>, 按清单顺序排列,
+      用于精确复现历史 run (清单 = 该 run 所在机器的目录序, 如 splits/order_mesa_212_20260817.txt)。
+    """
+    files = list(Path(path).glob("*.csv"))
+    manifest = os.environ.get(manifest_env)
+    if manifest:
+        want = [l.strip() for l in open(manifest) if l.strip()]
+        by_id = {re.findall(id_pattern, f.name)[0]: f for f in files}
+        missing = [s for s in want if s not in by_id]
+        if missing:
+            print(f"[WARNING] 顺序清单 {manifest}: {len(missing)} 个 ID 数据缺失: {missing[:10]}")
+        files = [by_id[s] for s in want if s in by_id]
+        if len(files) != len(want):
+            print(f"[WARNING] 顺序清单 {manifest}: 期望 {len(want)} 项, 实际匹配 {len(files)} 项")
+    else:
+        files = sorted(files)
+    return files
 
 
 def _load_radar_data(path):

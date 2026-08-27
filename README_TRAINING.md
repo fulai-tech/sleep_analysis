@@ -382,6 +382,13 @@ python sleep_analysis/classification/inference/inference_features.py \
 
 ### 已知问题 / 决策记录
 
+- ✅2026-08-27: **被试顺序确定性修复**（影响跨机器复现）——`create_index` 原用未排序的 `Path.glob`，
+  被试顺序 = 文件系统目录序，两台服务器目录序不同 → x_train batch 组成不同 → 同参数训练结果分叉
+  （实测：212 与本地复现，整体指标相近但混淆矩阵系统性偏移，deep 召回 35%→16%）。
+  现默认 `sorted(glob)` 保证跨机器确定性；若要精确复现历史 run，设置
+  `SLEEP_ORDER_MANIFEST=<每行一个被试ID的文件>` 按该 run 所在机器的目录序排列
+  （MESA 清单：`splits/order_mesa_212_20260817.txt`）。见 `datasets/helper.py::ordered_glob_csv`。
+  ⚠️ 用清单复现 08-17 run 时，训练指令需额外加 `SLEEP_ORDER_MANIFEST=splits/order_mesa_212_20260817.txt`。
 - `rrv.py`: RRV 因果改造（滤波 + 左对齐窗口），causal 分支由 `SLEEP_CAUSAL` 控制
 - `rr_utils.py`: process_rpoint 已抽为 MESA/SHHS 共用；causal 实现注释保留（HRV 决策：保持原版可比性）
 - `ecg.py`: 转发 `rr_utils.process_rpoint`

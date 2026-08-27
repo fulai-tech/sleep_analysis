@@ -5,7 +5,7 @@ from pathlib import Path
 import pandas as pd
 from tpcp import Dataset
 
-from sleep_analysis.datasets.helper import build_base_path_processed_mesa
+from sleep_analysis.datasets.helper import build_base_path_processed_mesa, ordered_glob_csv
 
 
 class MesaDataset(Dataset):
@@ -17,7 +17,8 @@ class MesaDataset(Dataset):
         path = build_base_path_processed_mesa()
 
         path = path.joinpath("features_full_combined").resolve()
-        path_list = list(Path(path).glob("*.csv"))
+        # ✅2026-08-27: 确定性顺序 — sorted, 或 SLEEP_ORDER_MANIFEST 清单序 (精确复现历史 run)
+        path_list = ordered_glob_csv(path, r"(\d{4})\.csv")
         # 20260805: 与 merge_features 同样的修复 — 只从文件名提取 ID,
         # 避免路径中的日期数字 (如 processed_data_no_leak_20260805 的 2026/0805)
         # 被当成伪被试 ID (会读取不存在的 features_combined2026.csv 崩溃)
