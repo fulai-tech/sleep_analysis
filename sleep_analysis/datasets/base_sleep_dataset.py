@@ -32,6 +32,10 @@ class BaseSleepDataset(Dataset):
     person_pool: str = ""  # 空 = 独立池 (不参与联合划分)
     modality_defaults: list = ["ACT", "HRV", "RRV"]
     processed_path: Optional[Path] = None  # 处理后数据目录 (含 features_full_combined; 子类 __init__ 设置)
+    split_file: Optional[str] = None       # 本数据集自己的划分文件 (项目内相对路径, 如
+                                           # "splits/split_mesa_1121_20260806.json"); 由 study_data.json
+                                           # 的 "<数据集>_split_file" 键配置, 换划分版本只改配置不动代码;
+                                           # 训练时按请求的数据集分别加载再组合; None = 用随机划分
 
     # 模态 → 特征列名 (与训练侧 data_peparation 的历史选择完全一致,
     # 含 _hrv_median_nni 的重复项 — 保持输入维度与 get_num_input 的 HRV=8 对齐)

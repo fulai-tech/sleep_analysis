@@ -18,11 +18,12 @@ def _get_shhs_config(study: str):
     return {
         "processed_path": Path(cfg[f"{study}_processed_path"]),
         "data_path": Path(cfg[f"{study}_path"]),
+        "split_file": cfg.get(f"{study}_split_file"),   # 划分文件 (study_data.json 配置)
     }
 
 
-@register("SHHS1")
-@register("SHHS2")
+@register("SHHS1", study="shhs1")
+@register("SHHS2", study="shhs2")
 class ShhsDataset(BaseSleepDataset):
     """SHHS 数据集类，兼容 MESA 训练管线。
 
@@ -59,6 +60,8 @@ class ShhsDataset(BaseSleepDataset):
         self.processed_path = (processed_path if isinstance(processed_path, Path)
                                else Path(processed_path)) if processed_path is not None \
             else self._config["processed_path"]
+        # 每个子集自己的划分文件 (由 study_data.json 配置, 与 split_mixed_20260808 逐位一致)
+        self.split_file = self._config["split_file"]
         super().__init__(groupby_cols=groupby_cols, subset_index=subset_index, **kwargs)
 
     @property

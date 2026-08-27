@@ -98,6 +98,14 @@ def main():
     output.write_text(json.dumps(split, indent=2, ensure_ascii=False))
     print(f"[split] 写入: {output}")
 
+    # ✅20260825: 每数据集一个划分文件 — 训练脚本按数据集自声明 split_file 组合。
+    # MESA 沿用已有 splits/split_mesa_1121_20260806.json (mesa_part 由其过滤而来, 不重复写)。
+    out_date = __import__('datetime').datetime.now().strftime("%Y%m%d")
+    for _key, _part in [("shhs1", shhs1_part), ("shhs2", shhs2_part)]:
+        out = Path(f"splits/split_{_key}_{out_date}.json")
+        out.write_text(json.dumps(_part, indent=2, ensure_ascii=False))
+        print(f"[split] 写入: {out}")
+
     # 一致性校验: 每个数据集内 train/val/test 互斥且全覆盖
     for name, part in split.items():
         all_ids = set(sum(part.values(), []))

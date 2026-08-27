@@ -10,7 +10,8 @@ from sleep_analysis.datasets.helper import build_base_path_processed_mesa
 from sleep_analysis.datasets.registry import register
 
 
-@register("MESA_Sleep")
+@register("MESA")
+@register("MESA_Sleep")   # 旧名别名 (旧 config.json 的 --load-weights 恢复/旧命令兼容)
 class MesaDataset(BaseSleepDataset):
     """
     Dataset class for the MESA dataset created according to the tpcp framework (https://github.com/mad-lab-fau/tpcp)
@@ -31,6 +32,9 @@ class MesaDataset(BaseSleepDataset):
         self.processed_path = (processed_path if isinstance(processed_path, Path)
                                else Path(processed_path)) if processed_path is not None \
             else build_base_path_processed_mesa()
+        # 划分文件由 study_data.json 配置 (20260825): 换划分版本只改配置, 不动代码
+        with open(Path(__file__).parents[2] / "study_data.json") as _f:
+            self.split_file = json.load(_f).get("mesa_split_file")
         super().__init__(groupby_cols=groupby_cols, subset_index=subset_index, **kwargs)
 
     @property

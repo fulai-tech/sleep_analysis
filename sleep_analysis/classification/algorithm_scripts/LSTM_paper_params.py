@@ -9,7 +9,7 @@ LSTM 训练脚本 —— 使用论文 Krauss et al. (2025) 中的最优参数
 
 用法:
     # MESA 5 分类 (论文默认, ACT+HRV+RRV, 170 epoch)
-    python LSTM_paper_params.py -d MESA_Sleep -c 5stage
+    python LSTM_paper_params.py -d MESA -c 5stage
 
     # SHHS1 / SHHS2 (无体动数据，自动使用 HRV+RRV)
     python LSTM_paper_params.py -d SHHS1 -c 5stage
@@ -20,7 +20,7 @@ LSTM 训练脚本 —— 使用论文 Krauss et al. (2025) 中的最优参数
 
     # 切换模态或超参数
     python LSTM_paper_params.py -c 3stage --hidden 256 --layers 4 --lr 1e-4
-    python LSTM_paper_params.py -d MESA_Sleep --modality HRV RRV
+    python LSTM_paper_params.py -d MESA --modality HRV RRV
 
     # 查看所有参数
     python LSTM_paper_params.py --help
@@ -56,12 +56,15 @@ from sleep_analysis.datasets.registry import get_dataset, get_dataset_class
 # ---------------------------------------------------------------------------
 parser = argparse.ArgumentParser(description="LSTM Sleep Stage Classification")
 # 数据集
-parser.add_argument("-d", "--dataset", default="MESA_Sleep",
-                    help="数据集: MESA_Sleep / SHHS1 / SHHS2 / MESA_Sleep+SHHS2 等任意 '+' 组合")
+parser.add_argument("-d", "--dataset", default="MESA",
+                    help="数据集: MESA / SHHS1 / SHHS2 / MESA+SHHS2 等任意 '+' 组合"
+                         " (MESA_Sleep 为 MESA 的旧名别名)")
 parser.add_argument("--small", action="store_true", help="只用 20 个被试验证管线")
 parser.add_argument("--split-file", type=str, default=None,
                     help="划分名单 JSON (含 train/val/test 三个被试 ID 数组); "
-                         "指定后按名单划分而非随机划分 (保证跨数据集/实验可比)")
+                         "指定后按名单划分而非随机划分 (保证跨数据集/实验可比)。"
+                         "不指定时: 若所有请求数据集都声明了 split_file (数据集自描述), "
+                         "自动加载各自的划分文件再组合 (20260825)")
 # 分类
 parser.add_argument("-c", "--classification", default="5stage",
                     choices=["binary", "3stage", "4stage", "5stage"])
@@ -448,6 +451,65 @@ if args.split_file is not None:
             _n_want = len(_want[_k])
             _flag = "  ← 不一致" if _n_actual != _n_want else ""
             print(f"[SPLIT] {_k}: 名单 {_n_want} -> 实际 {_n_actual}{_flag}")
+elif all(get_dataset(_p).split_file for _p in DATASET_PARTS):
+    # ✅20260825: 每个数据集自声明 split 文件 — 按请求的数据集分别加载各自的
+    # 划分再组合。同 person_pool 数据集 (如 SHHS1/2) 的划分由 make_splits 联合
+    # 生成 (同人两晚不跨集), 组合后这里再做一次人员级跨集断言防泄漏。
+    print("[SPLIT] 按数据集自声明 split 文件组合:")
+    if _singleton:
+        ds = get_dataset(DATASET_PARTS[0])
+        if args.small:
+            ds = ds[0:20]
+        _want = {k: set(v) for k, v in json.load(open(ds.split_file)).items()}
+        _ids = [str(s) for s in ds.index["subj_id"]]
+        train_set = ds[[i for i, sid in enumerate(_ids) if sid in _want["train"]]]
+        val_set = ds[[i for i, sid in enumerate(_ids) if sid in _want["val"]]]
+        test_set = ds[[i for i, sid in enumerate(_ids) if sid in _want["test"]]]
+        print(f"  [{DATASET_PARTS[0].lower()}] train={len(train_set)} "
+              f"val={len(val_set)} test={len(test_set)}")
+    else:
+        _train_sources, _val_sources, _test_sources = {}, {}, {}
+        for _name in DATASET_PARTS:
+            ds = get_dataset(_name)
+            if args.small:
+                ds = ds[0:20]
+            _want = {k: set(v) for k, v in json.load(open(ds.split_file)).items()}
+            _ids = [str(s) for s in ds.index["subj_id"]]
+            _tr = [i for i, sid in enumerate(_ids) if sid in _want["train"]]
+            _va = [i for i, sid in enumerate(_ids) if sid in _want["val"]]
+            _te = [i for i, sid in enumerate(_ids) if sid in _want["test"]]
+            _key = _name.lower().replace("_", "")
+            _train_sources[_key] = ds[_tr] if _tr else ds[0:0]
+            _val_sources[_key] = ds[_va] if _va else ds[0:0]
+            _test_sources[_key] = ds[_te] if _te else ds[0:0]
+            _outside = [sid for sid in _ids
+                        if sid not in (_want["train"] | _want["val"] | _want["test"])]
+            print(f"  [{_key}] train={len(_tr)} val={len(_va)} test={len(_te)}"
+                  + (f" (名单外 {len(_outside)} 个)" if _outside else ""))
+        train_set = MixedDataset(_train_sources)
+        val_set = MixedDataset(_val_sources)
+        test_set = MixedDataset(_test_sources)
+        dataset = train_set  # 兼容后续打印
+
+        # 同池数据集人员级跨集断言 (如 SHHS1/SHHS2 同人两晚不跨集)
+        for _pool, _names in _pools.items():
+            if len(_names) < 2:
+                continue
+
+            def _de_prefix(ids):
+                """从 shhs1@201206 → 201206 提取原始被试 ID"""
+                return {str(s).split("@", 1)[-1] for s in ids}
+
+            _tr_ids = _de_prefix(train_set.index["subj_id"])
+            _va_ids = _de_prefix(val_set.index["subj_id"])
+            _te_ids = _de_prefix(test_set.index["subj_id"])
+            assert _tr_ids.isdisjoint(_va_ids), \
+                f"{_pool} train/val overlap in per-dataset split! {len(_tr_ids & _va_ids)} subjects"
+            assert _tr_ids.isdisjoint(_te_ids), \
+                f"{_pool} train/test overlap in per-dataset split! {len(_tr_ids & _te_ids)} subjects"
+            assert _va_ids.isdisjoint(_te_ids), \
+                f"{_pool} val/test overlap in per-dataset split! {len(_va_ids & _te_ids)} subjects"
+            print(f"[SPLIT] {_pool} 人员级跨集检查 ✓")
 elif _singleton:
     train_set, test_set = get_random_split(dataset=dataset)
     train_set, val_set = get_random_split(dataset=train_set)
