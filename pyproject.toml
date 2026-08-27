@@ -7,7 +7,7 @@ license = "MIT"
 readme = "README.md"
 
 [tool.poetry.dependencies]
-python = ">=3.9.0,<3.11"
+python = ">=3.10,<3.11"
 nbstripout = "^0.6.1"
 seaborn = "0.13.2"
 fau-colors = "^1.2.0"
@@ -18,13 +18,15 @@ torch = ">=2.5.0"
 poethepoet = "^0.24.2"
 ipykernel = "^6.29.0"
 mne = "1.4.2"
-empkins-micro = {path = "../empkins-micro", extras=["radar"], develop = true}
+empkins-micro = {path = "../empkins-micro", develop = true}
 mesa-data-importer = {path = "../mesa-data-importer", develop = true}
 black = "^24.8.0"
 hrv-analysis = "^1.0.4"
 optuna-integration = "^4.0.0"
 tpcp = "^2.0.0"
 focal-loss-torch = "^0.1.2"
+onnx = "1.22.0"
+onnxruntime = "1.23.2"
 
 
 [tool.poetry.dev-dependencies]
