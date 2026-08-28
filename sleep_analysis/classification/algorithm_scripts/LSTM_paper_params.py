@@ -108,6 +108,12 @@ parser.add_argument("--inv-freq", action="store_true",
 parser.add_argument("--internal-norm", action="store_true",
                     help="恢复旧版模型内部 per-batch 归一化 (08-07 前行为, 复现 08-06 基线用)。"
                          "默认关闭 (外部 scaler 作为唯一归一化)")
+parser.add_argument("--shuffle-mode", type=str, default="none",
+                    choices=["none", "sample", "subject"],
+                    help="每 epoch 打乱训练样本 (numpy CPU, seed+epoch 派生, 跨机器可复现)。"
+                         "none=固定顺序 (复现历史 run 用); sample=样本级打乱 (拟合快但全量数据"
+                         "实测 val 早衰); subject=按被试打乱 (保留批内连续窗口, 推荐)。"
+                         "注意: 不用 torch.randperm 的 CUDA 路径 — CUDA RNG 与 GPU 架构相关")
 
 args = parser.parse_args()
 
@@ -138,11 +144,20 @@ if args.load_weights:
         args.patience = saved_config.get("patience", args.patience)
         args.inv_freq = saved_config.get("inv_freq", args.inv_freq)
         args.internal_norm = saved_config.get("internal_norm", args.internal_norm)
+        # 兼容旧 config: 2026-08-27 前用 "shuffle" 字段 (true=sample), 现统一为 shuffle_mode
+        args.shuffle_mode = saved_config.get(
+            "shuffle_mode", "sample" if saved_config.get("shuffle") else args.shuffle_mode
+        )
         args.split_file = saved_config.get("split_file", args.split_file)
     else:
         print(f"[WARNING] {config_file} not found, using current CLI params."
               f" 确保超参数与训练时一致，否则 load_state_dict 会报错!")
 
+# 全量数据实测: sample 级打乱在固定 lr 下拟合过快 → val 在 epoch 4-5 达峰后恶化
+# (固定序 30+ epoch 持续下降), 早停被真实触发; 与 --internal-norm 无关 (2×2 对照)。
+if args.shuffle_mode == "sample":
+    print("[WARNING] --shuffle-mode sample: 全量数据实测 val 在 epoch 4-5 达峰后恶化 "
+          "(拟合过快, 固定 lr 无衰减)。建议 --shuffle-mode subject 或降 lr。", flush=True)
 # ✅2026-08-11: stateful 依赖因果窗口 (状态化 = 只用已见数据); 校验须在 config restore 之后,
 # 否则 --load-weights <causal run> --stateful 会被 parse 期校验误杀 (causal 在 restore 后才恢复)
 if args.stateful and not args.causal:
@@ -314,6 +329,7 @@ config = {
     "patience": args.patience,
     "inv_freq": args.inv_freq,
     "internal_norm": args.internal_norm,
+    "shuffle_mode": args.shuffle_mode,
     "split_file": args.split_file,
     "seed": args.seed,
     "load_weights": args.load_weights,
@@ -568,8 +584,10 @@ if args.load_weights:
         print(f"  [WARN] No companion scaler found at {_companion_scaler} — "
               f"将用当前 train_set 拟合 scaler (与 checkpoint 不配套, 结果不可靠!)")
 
+_train_lens = []
 x_train, y_train, x_val, y_val, x_test, y_test, scaler = data_loader.get_final_tensors(
-    args.modality, train_set, val_set, test_set, args.classification, scaler=_load_scaler
+    args.modality, train_set, val_set, test_set, args.classification,
+    scaler=_load_scaler, train_subj_lens=_train_lens
 )
 print(f"  x_train: {x_train.shape}, y_train: {y_train.shape}")
 print(f"  x_val:   {x_val.shape}, y_val:   {y_val.shape}")
@@ -648,6 +666,9 @@ model = LSTM(
     patience=args.patience,
     inv_freq=args.inv_freq,
     internal_norm=args.internal_norm,
+    shuffle_mode=args.shuffle_mode,
+    seed=args.seed,
+    subject_lens=_train_lens if args.shuffle_mode == "subject" else None,
 )
 
 # 加载已有权重 (如果指定)

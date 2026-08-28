@@ -158,7 +158,13 @@ class DataPreparation:
         overlap=None,
         classification_type="binary",
         padding=False,
+        subj_lens=None,
     ):
+        """
+        subj_lens : list, optional
+            ✅2026-08-27: 传入空列表则按被试顺序追加每个被试的样本数 (按被试打乱训练用)。
+            不传 = 行为与原来完全一致。
+        """
         """
         Returns and processes the data and brings them into the correct way to feed into the deep learning network
         :dataset: Dataset of tpcp class
@@ -200,6 +206,8 @@ class DataPreparation:
             n = x_scaled.shape[0]
             x_tensor[cursor:cursor + n] = torch.from_numpy(x_scaled.astype(np.float32))
             y_tensor[cursor:cursor + n, 0] = torch.from_numpy(y_mat.astype(np.float32))
+            if subj_lens is not None:
+                subj_lens.append(n)  # ✅2026-08-27: 按被试打乱需要被试边界
             cursor += n
 
         return x_tensor, y_tensor, scaler
@@ -235,7 +243,7 @@ class DataPreparation:
             )
         return frames
 
-    def get_final_tensors(self, modality, train: Dataset, val: Dataset, test: Dataset, classification_type="binary", scaler=None):
+    def get_final_tensors(self, modality, train: Dataset, val: Dataset, test: Dataset, classification_type="binary", scaler=None, train_subj_lens=None):
         """
         Return final sequential tensors for each input modality
         This is the function that gets called in class LSTM_Optuna
@@ -258,6 +266,7 @@ class DataPreparation:
             overlap=self.overlap,
             modality=modality,
             classification_type=classification_type,
+            subj_lens=train_subj_lens,  # ✅2026-08-27: 按被试打乱需要训练集被试边界
             padding=True,
         )
         x_val, y_val, scaler = self.get_data(

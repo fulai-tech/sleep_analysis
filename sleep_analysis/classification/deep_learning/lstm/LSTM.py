@@ -110,6 +110,9 @@ class LSTM:
         patience=5,
         inv_freq=False,
         internal_norm=False,
+        shuffle_mode="none",   # ✅2026-08-27: "none" | "sample" (样本级) | "subject" (按被试, 推荐)
+        seed=42,
+        subject_lens=None,     # shuffle_mode="subject" 需要: 训练集按被试顺序的每被试样本数
     ):
         torch.manual_seed(seed=42)
         torch.cuda.manual_seed(seed=42)
@@ -142,6 +145,9 @@ class LSTM:
         self.patience = patience          # ✅2026-08-13: 早停耐心 (stateful 摆动周期长时可调大)
         self.inv_freq = inv_freq          # ✅2026-08-13: 类权重 1/freq (默认 1-freq)
         self.internal_norm = internal_norm  # ✅2026-08-14: 旧版内部 per-batch 归一化 (复现 08-06 基线用)
+        self.shuffle_mode = shuffle_mode  # ✅2026-08-27: 每 epoch 打乱模式 (numpy CPU 实现)
+        self.seed = seed                  # shuffle 的随机种子 (per-epoch: seed + epoch)
+        self.subject_lens = subject_lens  # shuffle_mode="subject" 的被试边界
 
         if self.use_gpu:
             self.device = "cuda"
@@ -166,6 +172,18 @@ class LSTM:
         # load batched data
         if self.stateful:
             x_batch_train_list = y_batch_train_list = None  # chunk 调度在 epoch 循环内
+        elif self.shuffle_mode in ("sample", "subject"):
+            x_batch_train_list = y_batch_train_list = None  # 每 epoch 打乱后重建 (见 epoch 循环)
+            if self.shuffle_mode == "subject":
+                # 被试边界 (x_train 按被试顺序拼接) — 只在 subject 模式需要
+                if self.subject_lens is None:
+                    raise ValueError("shuffle_mode=subject 需要 subject_lens (训练集每被试样本数)")
+                if sum(self.subject_lens) != x_train.shape[0]:
+                    raise ValueError(
+                        f"subject_lens 总和 {sum(self.subject_lens)} != x_train 样本数 {x_train.shape[0]}"
+                    )
+                _subj_ends = np.cumsum(self.subject_lens)
+                _subj_starts = np.concatenate([[0], _subj_ends[:-1]])
         else:
             x_batch_train_list, y_batch_train_list = self.batch_loader(x_train, y_train)
 
@@ -252,6 +270,28 @@ class LSTM:
                             h, c, buf, detach_state=(chunk_start > 0), train_losses=train_losses,
                         )
             else:
+                # ✅2026-08-27: per-epoch 打乱 (--shuffle-mode)。
+                # numpy (CPU) 实现, seed+epoch 派生 — 跨机器/跨运行确定。
+                # ⚠️ 不用 torch.randperm 的 CUDA 路径: CUDA RNG 流与 GPU 架构相关
+                # (同 seed 在不同型号 GPU 上打乱不同, 见 2026-08-27 排查记录)。
+                # 模式:
+                #   sample  — 样本级打乱 (iid batch): 拟合快 ~4×, 全量数据实测 val 早衰
+                #   subject — 按被试打乱 (保留批内连续窗口的隐式正则): 推荐
+                if self.shuffle_mode == "sample":
+                    _rng = np.random.default_rng(self.seed + epoch)
+                    _perm = _rng.permutation(x_train.shape[0])
+                    x_batch_train_list, y_batch_train_list = self.batch_loader(
+                        x_train[_perm], y_train[_perm]
+                    )
+                elif self.shuffle_mode == "subject":
+                    _rng = np.random.default_rng(self.seed + epoch)
+                    _idx = np.concatenate([
+                        np.arange(_subj_starts[i], _subj_ends[i])
+                        for i in _rng.permutation(len(self.subject_lens))
+                    ])
+                    x_batch_train_list, y_batch_train_list = self.batch_loader(
+                        x_train[_idx], y_train[_idx]
+                    )
                 # iterate over all batches of training data
                 for x_batch_train, y_batch_train in zip(x_batch_train_list, y_batch_train_list):
                     if self.use_gpu:
