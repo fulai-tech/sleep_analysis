@@ -15,6 +15,7 @@
                       命名不同的数据集如 D04 覆盖此项)
 """
 
+import os
 import re
 from pathlib import Path
 from typing import Optional
@@ -57,8 +58,32 @@ class BaseSleepDataset(Dataset):
     # ------------------------------------------------------------------
     def create_index(self):
         path = self.processed_path.joinpath("features_full_combined").resolve()
-        path_list = list(Path(path).glob("*.csv"))
+        files = list(Path(path).glob("*.csv"))
+        # ✅2026-08-27: 确定性顺序 — Path.glob 不排序, 被试顺序 = 文件系统目录序,
+        # 跨机器不一致 (目录序不同 → batch 组成不同 → 同参数训练结果分叉)。
+        # 默认 sorted 保证跨机器确定性; 设置 SLEEP_ORDER_MANIFEST=<每行一个被试ID的文件>
+        # 则按清单顺序排列 — 精确复现历史 run (清单 = 该 run 所在机器的目录序,
+        # 如 splits/order_mesa_212_20260817.txt)。
+        manifest = os.environ.get("SLEEP_ORDER_MANIFEST")
+        if manifest:
+            want = [l.strip() for l in open(manifest) if l.strip()]
+            by_id = {re.findall(self.id_pattern, f.name)[0]: f for f in files}
+            matched = [s for s in want if s in by_id]
+            if not matched:
+                # 清单与本数据集 ID 格式完全不匹配 (如 MESA 4 位 ID 清单用于 SHHS 6 位 ID) →
+                # 退回排序序, 避免整集被试被静默丢弃 (训练会崩在空 train 或静默丢数据集)
+                print(f"[WARNING] 顺序清单 {manifest} 与本数据集 "
+                      f"(person_pool={self.person_pool}, id_pattern={self.id_pattern}) "
+                      f"完全不匹配, 退回排序序", flush=True)
+                files = sorted(files)
+            else:
+                missing = [s for s in want if s not in by_id]
+                if missing:
+                    print(f"[WARNING] 顺序清单 {manifest}: {len(missing)} 个 ID 数据缺失: {missing[:10]}")
+                files = [by_id[s] for s in matched]
+        else:
+            files = sorted(files)
         # 只从文件名提取 ID, 避免路径中的数字串 (如 processed_data_20260805 的
         # 2026/0805) 被当成伪被试 ID (20260805 修复)
-        subj_id = [re.findall(self.id_pattern, f.name)[0] for f in path_list]
+        subj_id = [re.findall(self.id_pattern, f.name)[0] for f in files]
         return pd.DataFrame(subj_id, columns=["subj_id"])
