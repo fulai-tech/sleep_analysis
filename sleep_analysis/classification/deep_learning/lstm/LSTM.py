@@ -113,6 +113,7 @@ class LSTM:
         shuffle_mode="none",   # ✅2026-08-27: "none" | "sample" (样本级) | "subject" (按被试, 推荐)
         seed=42,
         subject_lens=None,     # shuffle_mode="subject" 需要: 训练集按被试顺序的每被试样本数
+        wake_weight=1.0,       # ✅2026-08-28: 只放大 wake (类0) 的 loss 权重; 1.0 = 不变
     ):
         torch.manual_seed(seed=42)
         torch.cuda.manual_seed(seed=42)
@@ -148,6 +149,7 @@ class LSTM:
         self.shuffle_mode = shuffle_mode  # ✅2026-08-27: 每 epoch 打乱模式 (numpy CPU 实现)
         self.seed = seed                  # shuffle 的随机种子 (per-epoch: seed + epoch)
         self.subject_lens = subject_lens  # shuffle_mode="subject" 的被试边界
+        self.wake_weight = wake_weight    # ✅2026-08-28: wake (类0) 的 loss 权重放大因子
 
         if self.use_gpu:
             self.device = "cuda"
@@ -206,6 +208,13 @@ class LSTM:
             class_weights_cpu = 1 - class_weights       # 先在 CPU 算好
 
         print(f"class_weights: {class_weights_cpu.tolist()}", flush=True)
+
+        # ✅2026-08-28: --wake-weight — 只放大 wake (类0) 的 alpha, 其余类不变
+        # (对应 3:7 比例拉高 wake 份量; Adam 对 loss 全局缩放近似不变, 如需可配合降 lr)
+        if self.wake_weight != 1.0:
+            class_weights_cpu[0] *= self.wake_weight
+            print(f"class_weights (wake_weight x{self.wake_weight}): "
+                  f"{class_weights_cpu.tolist()}", flush=True)
 
         class_weights = class_weights_cpu.to(self.device)   # 最后才搬上 GPU
 

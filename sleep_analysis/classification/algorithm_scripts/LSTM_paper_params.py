@@ -114,6 +114,10 @@ parser.add_argument("--shuffle-mode", type=str, default="none",
                          "none=固定顺序 (复现历史 run 用); sample=样本级打乱 (拟合快但全量数据"
                          "实测 val 早衰); subject=按被试打乱 (保留批内连续窗口, 推荐)。"
                          "注意: 不用 torch.randperm 的 CUDA 路径 — CUDA RNG 与 GPU 架构相关")
+parser.add_argument("--wake-weight", type=float, default=1.0,
+                    help="只放大 wake (类0) 的 loss 权重: 权重 = (1-freq)*wake_weight。"
+                         "1.0 = 不变; 如 wake:睡眠=3:7 想拉平可试 7/3≈2.33。"
+                         "Adam 对 loss 全局缩放近似不变, 一般无需降 lr, 震荡明显再降")
 
 args = parser.parse_args()
 
@@ -148,6 +152,7 @@ if args.load_weights:
         args.shuffle_mode = saved_config.get(
             "shuffle_mode", "sample" if saved_config.get("shuffle") else args.shuffle_mode
         )
+        args.wake_weight = saved_config.get("wake_weight", args.wake_weight)
         args.split_file = saved_config.get("split_file", args.split_file)
     else:
         print(f"[WARNING] {config_file} not found, using current CLI params."
@@ -330,6 +335,7 @@ config = {
     "inv_freq": args.inv_freq,
     "internal_norm": args.internal_norm,
     "shuffle_mode": args.shuffle_mode,
+    "wake_weight": args.wake_weight,
     "split_file": args.split_file,
     "seed": args.seed,
     "load_weights": args.load_weights,
@@ -669,6 +675,7 @@ model = LSTM(
     shuffle_mode=args.shuffle_mode,
     seed=args.seed,
     subject_lens=_train_lens if args.shuffle_mode == "subject" else None,
+    wake_weight=args.wake_weight,
 )
 
 # 加载已有权重 (如果指定)

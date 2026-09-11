@@ -208,6 +208,7 @@ python LSTM_paper_params.py -c 5stage --small --quick
 | `--weight-decay` | 1e-5 | L2 正则化（硬编码在 LSTM.py 里） |
 | `--seed` | 42 | 随机种子 |
 | `--shuffle-mode` | `none` | 训练时打乱样本顺序的方式：`none`=不打乱；`subject`=每轮训练换一批被试的顺序（推荐）；`sample`=每轮把所有样本彻底打乱（不推荐）。详见下文「训练数据顺序」 |
+| `--wake-weight` | 1.0 | 只放大 wake（类 0）的 loss 权重：最终权重 = `(1-freq)×wake_weight`，其余类不变。如 wake:睡眠=3:7 想拉平可试 7/3≈2.33。Adam 对 loss 全局缩放近似不变，一般无需降 lr，震荡明显再降 |
 
 ### 训练数据顺序（--shuffle-mode）
 
