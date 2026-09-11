@@ -20,7 +20,7 @@ def get_num_classes(classification_type):
     return num_classes
 
 
-def get_num_input(modality, act_mode="none"):
+def get_num_input(modality, missing_mode=False):
     """
     Determine number of inputs dependent on data source and input modality
     """
@@ -34,9 +34,9 @@ def get_num_input(modality, act_mode="none"):
         num_inputs += 4
     if "EDR" in modality:
         num_inputs += 4
-    if act_mode != "none" and "ACT" in modality:
-        # ✅2026-08-28: --act-mode 增加的 _has_act 列 (仅当 modality 含 ACT 时数据侧才会加该列)
-        num_inputs += 1
+    if missing_mode:
+        # ✅2026-08-28: --missing-mode 为 modality 列表里每个模态增加一个 _has_<模态> 标志列
+        num_inputs += len(modality)
 
     mod_set = {"HRV", "ACT", "RRV", "EDR"}
     if not all({mod}.issubset(mod_set) for mod in modality):

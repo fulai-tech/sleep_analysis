@@ -209,7 +209,7 @@ python LSTM_paper_params.py -c 5stage --small --quick
 | `--seed` | 42 | 随机种子 |
 | `--shuffle-mode` | `none` | 训练时打乱样本顺序的方式：`none`=不打乱；`subject`=每轮训练换一批被试的顺序（推荐）；`sample`=每轮把所有样本彻底打乱（不推荐）。详见下文「训练数据顺序」 |
 | `--wake-weight` | 1.0 | 只放大 wake（类 0）的 loss 权重：最终权重 = `(1-freq)×wake_weight`，其余类不变。如 wake:睡眠=3:7 想拉平可试 7/3≈2.33。Adam 对 loss 全局缩放近似不变，一般无需降 lr，震荡明显再降 |
-| `--act-mode` | `none` | 混合训练时无 ACT 数据集（如 SHHS）的 ACT 特征处理：`none`=原行为（modality 含 ACT 但数据集无 ACT 列时报错，混合训练会自动剔除 ACT）；`zero`=填充 0 + 增加 `_has_act` 列（0/1）；`median`=填充训练集 ACT 中位数 + `_has_act` 列。⚠️ MESA 的 ACT 分布严重右偏（78% epoch 为 0），中位数=0，故 `median` 实际效果与 `zero` 相同；填 0 使 SHHS 与 MESA 静止期重合，反数据集身份泄露效果最好。填充值存入 scaler.json（`act_fill_value`），评估/推理必须复用 |
+| `--missing-mode` | 关 | 混合训练时数据集缺某模态的处理：**关闭**=原行为（ACT 自动剔除；HRV/RRV 缺失报错，不能训练）；**开启**=缺失模态特征**填 0**（先填 0 再标准化），并为 modality 列表里**每个模态**增加 `_has_<模态>` 标志列（0/1，布局统一：`[ACT..., _has_act, HRV..., _has_hrv, RRV..., _has_rrv]`）。填 0 使缺失数据与有数据集的低活动期（MESA 的 ACT 78% 为 0）重合，数值通道不泄露数据集身份，模型只能依赖 `_has_*` 标志。⚠️ 模态缺失检测目前用硬编码正则（`_acc`/`_hrv`/`RRV`），新数据集若列名不同需同步调整 |
 
 ### 训练数据顺序（--shuffle-mode）
 

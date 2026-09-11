@@ -49,16 +49,14 @@ class DataPreparation:
     :param overlap: Overlap of Sequences: Highly impacts runtime
     """
 
-    def __init__(self, seq_len, overlap, causal=False, act_mode="none", act_fill_value=None):
+    def __init__(self, seq_len, overlap, causal=False, missing_mode=False):
         self.seq_len = seq_len
         self.overlap = overlap
         self.causal = causal   # True=只在左侧padding (实时分期), False=居中padding (原文)
-        # ✅2026-08-28: 无 ACT 数据集的 ACT 特征处理
-        #   none   = 原行为 (modality 含 ACT 但数据集无 ACT 列时报错)
-        #   zero   = 填充 0 + 增加 _has_act 列 (0/1)
-        #   median = 填充训练集 ACT 中位数 + _has_act 列 (推荐: 数值通道不泄露数据集身份)
-        self.act_mode = act_mode
-        self.act_fill_value = act_fill_value  # median 模式的填充值; None=在 get_data 里从训练集计算
+        # ✅2026-08-28: --missing-mode — 数据集缺某模态时的处理
+        #   True  = 缺失模态特征填 0, 并为 modality 列表里每个模态增加 _has_<模态> 标志列 (0/1)
+        #   False = 原行为 (ACT 由调用方自动剔除; HRV/RRV 缺失时报错 — 不能训练)
+        self.missing_mode = missing_mode
 
     def get_sequence_data(self, features: pd.DataFrame, ground_truth: pd.DataFrame, overlap, padding=False):
         """
@@ -135,30 +133,26 @@ class DataPreparation:
         features = pd.DataFrame()
         all_features = subj.feature_table
 
-        if "ACT" in modality:
-            act_cols = fc("ACT")
-            has_act = not all_features.filter(regex="_acc").empty
-            if has_act:
-                act_feat = all_features.filter(regex="_acc")[act_cols]
-                has_col = np.ones(len(act_feat), dtype=float)
-            else:
-                # ✅2026-08-28: 无 ACT 数据集 (如 SHHS) — --act-mode 决定填充方式
-                if self.act_mode == "none":
-                    raise KeyError(
-                        f"数据集无 ACT 特征列但 modality 含 ACT — 请设置 --act-mode "
-                        f"(zero=填0 / median=填训练集中位数)")
-                fill = self.act_fill_value if self.act_fill_value is not None else 0.0
-                act_feat = pd.DataFrame(fill, index=all_features.index, columns=act_cols)
-                has_col = np.zeros(len(all_features), dtype=float)
-            features = pd.concat([features, act_feat], axis=1)
-            if self.act_mode != "none":
-                features["_has_act"] = has_col
-        if "HRV" in modality:
-            hrv_features = all_features.filter(regex="_hrv")[fc("HRV")]
-            features = pd.concat([features, hrv_features], axis=1)
-        if "RRV" in modality:
-            rrv_features = all_features.filter(regex="RRV")[fc("RRV")]
-            features = pd.concat([features, rrv_features], axis=1)
+        # ✅2026-08-28: 各模态统一处理 — 缺列时按 missing_mode 填 0 + 打标志, 布局统一:
+        #   [ACT..., _has_act, HRV..., _has_hrv, RRV..., _has_rrv]
+        def _mod_feat(mod_name, regex):
+            cols = fc(mod_name)
+            present = not all_features.filter(regex=regex).empty
+            if present:
+                return all_features.filter(regex=regex)[cols], np.ones(len(all_features), dtype=float)
+            if not self.missing_mode:
+                raise KeyError(
+                    f"数据集无 {mod_name} 特征列, 且未开启 --missing-mode — 不能训练。"
+                    f"开启后该模态填 0 并增加 _has_{mod_name.lower()} 标志列")
+            return (pd.DataFrame(0.0, index=all_features.index, columns=cols),
+                    np.zeros(len(all_features), dtype=float))
+
+        for _mod, _regex in [("ACT", "_acc"), ("HRV", "_hrv"), ("RRV", "RRV")]:
+            if _mod in modality:
+                _feat, _has = _mod_feat(_mod, _regex)
+                features = pd.concat([features, _feat], axis=1)
+                if self.missing_mode:
+                    features[f"_has_{_mod.lower()}"] = _has
         if "EDR" in modality:
             edr_features = all_features.filter(regex="EDR")[fc("EDR")]
             features = pd.concat([features, edr_features], axis=1)
@@ -200,24 +194,6 @@ class DataPreparation:
             )
             return self.get_sequence_data(features, ground_truth,
                                           overlap=overlap, padding=padding)
-
-        # ---- Pass 0: (--act-mode median) 从训练集有 ACT 的被试收集 ACT 值, 算填充中位数 ----
-        # ✅2026-08-28: 防泄漏 — 只用当前 dataset (训练集) 计算; val/test 复用缓存值。
-        # 有 ACT 列的被试 (MESA) 参与计算, 无 ACT 列的被试 (SHHS) 跳过。
-        if self.act_mode == "median" and "ACT" in modality and self.act_fill_value is None:
-            _act_vals = []
-            _fc = getattr(dataset, "feature_columns", None)
-            for subj in dataset:
-                _ft = subj.feature_table
-                if not _ft.filter(regex="_acc").empty:
-                    _act_vals.append(_ft.filter(regex="_acc")[_fc("ACT")].to_numpy().ravel())
-            if _act_vals:
-                self.act_fill_value = float(np.median(np.concatenate(_act_vals)))
-                print(f"[ACT fill] 训练集 ACT 中位数 = {self.act_fill_value:.6g} "
-                      f"({len(_act_vals)} 个有 ACT 的被试)", flush=True)
-            else:
-                self.act_fill_value = 0.0
-                print("[ACT fill] 训练集无任何 ACT 数据, 填充值用 0", flush=True)
 
         # ---- Pass 1: 统计总量 + fit scaler (不存全量数据) ----
         total_samples = 0

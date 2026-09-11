@@ -118,11 +118,10 @@ parser.add_argument("--wake-weight", type=float, default=1.0,
                     help="只放大 wake (类0) 的 loss 权重: 权重 = (1-freq)*wake_weight。"
                          "1.0 = 不变; 如 wake:睡眠=3:7 想拉平可试 7/3≈2.33。"
                          "Adam 对 loss 全局缩放近似不变, 一般无需降 lr, 震荡明显再降")
-parser.add_argument("--act-mode", type=str, default="none", choices=["none", "zero", "median"],
-                    help="无 ACT 数据集 (如 SHHS) 的 ACT 特征处理 (混合训练用): "
-                         "none=原行为 (modality 含 ACT 但数据集无 ACT 列时报错); "
-                         "zero=填充 0 + 增加 _has_act 列; "
-                         "median=填充训练集 ACT 中位数 + _has_act 列 (推荐, 数值通道不泄露数据集身份)")
+parser.add_argument("--missing-mode", action="store_true",
+                    help="数据集缺某模态时的处理 (混合训练用): 关闭=原行为 (ACT 自动剔除; "
+                         "HRV/RRV 缺失报错, 不能训练); 开启=缺失模态特征填 0, 并为 modality "
+                         "列表里每个模态增加 _has_<模态> 标志列 (0/1, 统一布局)")
 
 args = parser.parse_args()
 
@@ -157,7 +156,11 @@ if args.load_weights:
         args.shuffle_mode = saved_config.get(
             "shuffle_mode", "sample" if saved_config.get("shuffle") else args.shuffle_mode
         )
-        args.act_mode = saved_config.get("act_mode", args.act_mode)
+        # 兼容旧 config: "act_mode" (zero/median) → missing_mode=True; "missing_mode" 字段优先
+        args.missing_mode = saved_config.get(
+            "missing_mode",
+            args.missing_mode or saved_config.get("act_mode", "none") in ("zero", "median"),
+        )
         args.wake_weight = saved_config.get("wake_weight", args.wake_weight)
         args.split_file = saved_config.get("split_file", args.split_file)
     else:
@@ -205,13 +208,13 @@ for _p in DATASET_PARTS:
         if _m not in _default_modality:
             _default_modality.append(_m)
 if args.modality is not None:
-    # ✅2026-08-28: --act-mode (zero/median) 允许无 ACT 数据集参与 ACT 通道
-    # (填充 + _has_act 列) — 此时不再自动剔除 ACT
-    if not _has_actigraphy_all and "ACT" in args.modality and args.act_mode == "none":
+    # ✅2026-08-28: --missing-mode 允许无 ACT 数据集参与 ACT 通道 (填 0 + _has_act 列)
+    # — 此时不再自动剔除 ACT
+    if not _has_actigraphy_all and "ACT" in args.modality and not args.missing_mode:
         print("[WARNING] Some datasets have no actigraphy. Removing ACT from modality.")
         args.modality = [m for m in args.modality if m != "ACT"]
 else:
-    if args.act_mode == "none":
+    if not args.missing_mode:
         args.modality = [m for m in _default_modality if m != "ACT"] if not _has_actigraphy_all else _default_modality
     else:
         args.modality = _default_modality
@@ -347,7 +350,7 @@ config = {
     "internal_norm": args.internal_norm,
     "shuffle_mode": args.shuffle_mode,
     "wake_weight": args.wake_weight,
-    "act_mode": args.act_mode,
+    "missing_mode": args.missing_mode,
     "split_file": args.split_file,
     "seed": args.seed,
     "load_weights": args.load_weights,
@@ -581,16 +584,15 @@ print("\n[2/5] Preparing sequence data...")
 # 配套 scaler.json, 而不是用当前 train_set 重新拟合。否则权重来自 A run、归一化来自当前
 # 数据, --eval-only / 微调结果静默失真 (数据集或划分不同时尤其严重)
 _load_scaler = None
-_act_fill = None
 if args.load_weights:
     _companion_scaler = Path(args.load_weights).parent / "scaler.json"
     if _companion_scaler.exists():
         with open(_companion_scaler) as _f:
             _sc = json.load(_f)
         _n_sc = int(_sc["n_features"])
-        if _n_sc != get_num_input(args.modality, act_mode=args.act_mode):
+        if _n_sc != get_num_input(args.modality, missing_mode=args.missing_mode):
             print(f"[ERROR] 配套 scaler n_features ({_n_sc}) != 当前 modality 输入维数 "
-                  f"({get_num_input(args.modality, act_mode=args.act_mode)}) — 权重与数据不匹配",
+                  f"({get_num_input(args.modality, missing_mode=args.missing_mode)}) — 权重与数据不匹配",
                   flush=True)
             sys.exit(1)
         from sklearn.preprocessing import StandardScaler
@@ -599,15 +601,12 @@ if args.load_weights:
         _load_scaler.mean_ = np.array(_sc["mean_"], dtype=np.float64)
         _load_scaler.scale_ = np.array(_sc["scale_"], dtype=np.float64)
         print(f"  Companion scaler loaded from: {_companion_scaler}")
-        # ✅2026-08-28: --act-mode 的填充值也是模型的一部分 — 评估/推理必须用训练时的值
-        _act_fill = _sc.get("act_fill_value")
     else:
         print(f"  [WARN] No companion scaler found at {_companion_scaler} — "
               f"将用当前 train_set 拟合 scaler (与 checkpoint 不配套, 结果不可靠!)")
 
-# ✅2026-08-28: data_loader 在 companion scaler 之后创建 — --act-mode 需要训练时的填充值
 data_loader = DataPreparation(seq_len=args.seq_len, overlap=None, causal=args.causal,
-                              act_mode=args.act_mode, act_fill_value=_act_fill)
+                              missing_mode=args.missing_mode)
 
 _train_lens = []
 x_train, y_train, x_val, y_val, x_test, y_test, scaler = data_loader.get_final_tensors(
@@ -638,8 +637,6 @@ with open(scaler_path, "w") as f:
         "n_features": int(scaler.n_features_in_),
         "mean_": scaler.mean_.tolist(),
         "scale_": scaler.scale_.tolist(),
-        # ✅2026-08-28: --act-mode 的 ACT 填充值 (推理/评估必须复用同一个值)
-        "act_fill_value": data_loader.act_fill_value,
     }, f, indent=2)
 print(f"  Scaler saved to: {scaler_path}")
 
@@ -668,7 +665,7 @@ if not _singleton:
 # 3. 创建模型
 # ---------------------------------------------------------------------------
 print("\n[3/5] Creating LSTM model...")
-num_inputs = get_num_input(args.modality, act_mode=args.act_mode)
+num_inputs = get_num_input(args.modality, missing_mode=args.missing_mode)
 print(f"  Input dim: {num_inputs}")
 print(f"  Device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
 
