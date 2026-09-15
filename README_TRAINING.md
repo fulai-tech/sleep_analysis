@@ -89,9 +89,9 @@ sleep_analysis/classification/algorithm_scripts/LSTM_paper_params.py
 | `-d MESA_Sleep` | MESA | 有 | ACT+HRV+RRV | `preprocess_subset.py` |
 | `-d SHHS1` | SHHS1 | 无 | HRV+RRV | `preprocess_shhs.py --study shhs1` |
 | `-d SHHS2` | SHHS2 | 无 | HRV+RRV | `preprocess_shhs.py --study shhs2` |
-| `-d MESA_Sleep+SHHS1+SHHS2` | 混合 | 部分 | HRV+RRV | 上述预处理分别完成后 |
+| `-d MESA_Sleep+SHHS1+SHHS2` | 混合 | 部分 | HRV+RRV（`--missing-mode` 开启后可选 ACT+HRV+RRV） | 上述预处理分别完成后 |
 
-不指定 `-d` 时默认为 `MESA_Sleep`。SHHS / 混合数据集不指定 `--modality` 时自动使用 `HRV RRV`（无体动数据）。如果误传 `--modality ACT` 到 SHHS，脚本会打印警告并自动移除。
+不指定 `-d` 时默认为 `MESA_Sleep`。SHHS / 混合数据集不指定 `--modality` 时自动使用 `HRV RRV`（无体动数据）。如果误传 `--modality ACT` 到 SHHS，脚本会打印警告并自动移除——**要让无体动数据集也参与 ACT 通道（填 0 + `_has_act` 标志），需显式传 `--missing-mode`**（详见可调超参数表）。
 
 EDR 已弃用（2026-08 起），不再参与训练。
 
@@ -119,20 +119,30 @@ python LSTM_paper_params.py \
 
 ### 数据划分（--split-file）
 
-训练/验证/测试按被试级别划分。为跨实验一致性，可用固定 split 名单：
+训练/验证/测试按被试级别划分。**默认走各数据集自声明的 split 文件**（配置在 study_data.json）：
+
+| 配置键 | 数据集 | 当前值 |
+|---|---|---|
+| `mesa_split_file` | MESA | `splits/split_mesa_1121_20260806.json` |
+| `shhs1_split_file` | SHHS1 | `splits/split_shhs1_20260808.json` |
+| `shhs2_split_file` | SHHS2 | `splits/split_shhs2_20260808.json` |
+
+混合训练时按请求的数据集分别加载各自名单再组合（日志显示 `[SPLIT] 按数据集自声明 split 文件组合` + `shhs 人员级跨集检查 ✓`）。换划分版本只需改 study_data.json，不用动代码/命令。
+
+**优先级**：`--split-file` 显式传参 > 各数据集自声明 > 代码内自动划分（80/20 → 80/20）。
 
 ```bash
-# MESA 单独训练
+# 单数据集格式
 --split-file splits/split_mesa_1121_20260806.json
 
-# 混合训练 (MESA+SHHS1+SHHS2)
+# 多数据集格式 (JSON 按数据集分组的旧写法, 仍支持 — 会覆盖全部数据集的名单)
 --split-file splits/split_mixed_20260808.json
 ```
 
 - 单数据集格式：`{"train": [...], "val": [...], "test": [...]}`
-- 多数据集格式（混合训练）：`{"mesasleep": {...}, "shhs1": {...}, "shhs2": {...}}`，按数据集前缀匹配各自名单
-- SHHS1/2 的划分按 nsrrid 联合生成（同一参与者不会跨 train/val/test），由 `experiments/data_handling/make_splits.py` 生成
-- 不传 `--split-file` 时用代码内自动划分（80/20 → 80/20）
+- 多数据集格式：`{"mesasleep": {...}, "shhs1": {...}, "shhs2": {...}}`，按数据集前缀匹配各自名单
+- SHHS1/2 的划分按 nsrrid 联合生成（同一参与者不会跨 train/val/test），由 `experiments/data_handling/make_splits.py` 生成——两个文件需**成对更新**
+- ⚠️ `split_mixed_20260808.json` 已退役（内容与自声明的三个文件等价, MESA 部分仅差一个数据中不存在的 `0001`），仅保留作旧格式示例
 
 ### 论文参数复现
 
@@ -207,6 +217,7 @@ python LSTM_paper_params.py -c 5stage --small --quick
 | `--grad-clip` | 0.5 | 梯度裁剪阈值 |
 | `--weight-decay` | 1e-5 | L2 正则化（硬编码在 LSTM.py 里） |
 | `--seed` | 42 | 随机种子 |
+| `--patience` | 5 | 早停耐心：验证 loss 连续 N 个 epoch 不创新低即停。subject 打乱会让 val 曲线有摆动，建议配合调大到 10 |
 | `--shuffle-mode` | `none` | 训练时打乱样本顺序的方式：`none`=不打乱；`subject`=每轮训练换一批被试的顺序（推荐）；`sample`=每轮把所有样本彻底打乱（不推荐）。详见下文「训练数据顺序」 |
 | `--wake-weight` | 1.0 | 只放大 wake（类 0）的 loss 权重：最终权重 = `(1-freq)×wake_weight`，其余类不变。如 wake:睡眠=3:7 想拉平可试 7/3≈2.33。Adam 对 loss 全局缩放近似不变，一般无需降 lr，震荡明显再降 |
 | `--missing-mode` | 关 | 混合训练时数据集缺某模态的处理：**关闭**=原行为（ACT 自动剔除；HRV/RRV 缺失报错，不能训练）；**开启**=缺失模态特征**填 0**（先填 0 再标准化），并为 modality 列表里**每个模态**增加 `_has_<模态>` 标志列（0/1，布局统一：`[ACT..., _has_act, HRV..., _has_hrv, RRV..., _has_rrv]`）。填 0 使缺失数据与有数据集的低活动期（MESA 的 ACT 78% 为 0）重合，数值通道不泄露数据集身份，模型只能依赖 `_has_*` 标志。⚠️ 模态缺失检测目前用硬编码正则（`_acc`/`_hrv`/`RRV`），新数据集若列名不同需同步调整 |
@@ -283,6 +294,24 @@ python LSTM_paper_params.py \
 ```
 
 `--load-weights` 会自动读取同次训练的 `config.json`，恢复 `hidden_size`、`num_layers`、`classification`、`causal` 等全部超参数，无需手动指定。
+
+### 阈值扫描 + 折叠二分类（bias_scan.py）
+
+`exports_our/bias_scan.py` 对已训练模型做**推理期 wake 阈值扫描**（softmax 前给 wake logit 加 bias）并输出两种口径的完整指标：
+
+```bash
+python exports_our/bias_scan.py --run-dir exports_our/<timestamp>
+# 混合数据集按来源分别评估 (文件名带来源标识)
+python exports_our/bias_scan.py --run-dir exports_our/<timestamp> --source mesasleep
+```
+
+- **两种口径**分别存文件：`bias_scan_per_subject.txt`（逐被试 dl_score→跨被试平均，与训练日志一致）/ `bias_scan_pooled.txt`（全局池化）
+- 每个 bias 输出 **4stage** 与 **折叠二分类（light+deep+rem→sleep, wake/sleep）** 的 7 项指标 + 混淆矩阵
+- `--source`（别名 `--filter`）按来源前缀过滤，结果存 `bias_scan_<source>_*.txt`
+- logits 缓存在 run 目录的 `per_subject_logits.pkl`，重复扫描秒出；`--no-cache` 强制重新推理
+- bias=0 行与训练日志一致，可作自检
+
+**实验结论（2026-08/09）**：训练期 `--wake-weight` 与推理期 bias **效果等价**（权重 W ≈ logit 偏移 log W）——四组权重（1.0/1.8/2.5/4.0）在相同 wake 召回下指标重合，曲线形状不变、只平移。若推理端可加 bias，优先用 bias（零训练成本）；只有部署端改不了 softmax 前逻辑时才用 `--wake-weight`。
 
 ---
 
@@ -395,6 +424,11 @@ python sleep_analysis/classification/inference/inference_features.py \
 
 ### 已知问题 / 决策记录
 
+- ✅2026-09: **缺失模态统一处理**（`--missing-mode`）——数据集缺某模态时填 0 + 为每个模态加 `_has_<模态>` 标志列（布局 `[ACT..., _has_act, HRV..., _has_hrv, RRV..., _has_rrv]`）。设计取舍：填 0 使缺失数据与 MESA 低活动期（78% epoch 为 0）重合，数值通道不泄露数据集身份，模型只能依赖显式标志。⚠️ 已知局限：若某模态只在极少数数据集缺失，`_has_*` 与数据集身份共线（模型无法区分"属性"和"身份"）——打破共线需要引入同属性的多个数据集。⚠️ 模态检测目前用硬编码正则（`_acc`/`_hrv`/`RRV`），新数据集列名不同需同步调整
+- ✅2026-08-28: `--wake-weight`（只放大 wake 类 loss 权重）；实测与推理 bias 等价（见评测章节结论）
+- ✅2026-08-27: `--shuffle-mode {none,sample,subject}`（每 epoch 打乱；subject 模式推荐）；被试顺序确定性修复（sorted/manifest，解决跨机器复现）
+- ✅2026-08-31: ACT 填充值实验发现——MESA 的 ACT 中位数=0（78% epoch 无活动量），故"中位数填充"退化为"填 0"，后者反身份泄露效果最优
+- ⚠️ 推理引擎（`engine_torch.py` / `engine_onnx.py`）**尚未支持 `--missing-mode`** 模型的 `_has_*` 列构造与填 0 逻辑——部署这类模型前需补
 - `rrv.py`: RRV 因果改造（滤波 + 左对齐窗口），causal 分支由 `SLEEP_CAUSAL` 控制
 - `rr_utils.py`: process_rpoint 已抽为 MESA/SHHS 共用；causal 实现注释保留（HRV 决策：保持原版可比性）
 - `ecg.py`: 转发 `rr_utils.process_rpoint`
