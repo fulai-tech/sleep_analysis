@@ -5,6 +5,8 @@
 1. **按秒参数化**。原实现 ``_moving_average(window_size=19000)`` 是**采样点数**,
    在 D04 的 1953.125 Hz 下 = 9.73 s；直接用在我们 20 Hz 信号上会变成 950 s。
    这里统一用 ``window_s`` 秒, 内部换算 ``round(window_s * fs)``。
+   默认值直接取 **10 s**, 不再沿用 D04 的 ``19000/1953.125`` 换算 —— 两者物理上
+   量级等价, 没必要维护一个绑定对方采样率的推导。
 
 2. **因果分支**。原实现有两处整夜统计量 —— ``_scale_df`` 的 ``StandardScaler``
    和 ``_normalize`` 的整文件 min/max —— 都是未来泄漏。因果分支改用
@@ -29,8 +31,9 @@ import scipy.signal as ss
 
 import sleep_analysis.processing_config as pc
 
-# 原实现在 1953.125 Hz 下用 19000 样本 → 9.728 s
-DEFAULT_MA_WINDOW_S = 19000 / 1953.125
+# 滑动平均窗长（秒）。D04 原实现用 19000 样本 @1953.125 Hz = 9.728 s,
+# 本管线直接取 10 s —— 量级等价, 不维护采样率相关的换算。
+DEFAULT_MA_WINDOW_S = 10.0
 DEFAULT_THRESHOLD = 0.2
 
 
