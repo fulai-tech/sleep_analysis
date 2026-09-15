@@ -234,6 +234,150 @@ python LSTM_paper_params.py -c 5stage --small --quick
 
 ---
 
+## IR-UWB 20 Hz 雷达（预处理管线）
+
+针对我方 IR-UWB 雷达（20 Hz 单通道，呼吸+心搏混叠）的**独立预处理管线**，
+产出与 MESA/SHHS 同格式的特征表 CSV。
+
+⚠️ **与本仓库的 MESA/D04 处理完全无关**：硬件、采样率、信号格式都不同。自包含在
+`sleep_analysis/preprocessing/iruwb/` + `experiments/data_handling/*_iruwb.py`，
+不 import 也不修改 MESA/D04 的任何模块。只在**特征列名与语义**上对齐
+（ACT 1 + HRV 8 + RRV 4 = 13 槽位），为将来的迁移学习留余地 —— 但当前
+**没有**对应的 dataset class，训练侧尚未接入。
+
+### 快速开始
+
+```bash
+cd third_party/sleep_analysis
+
+# 1) 生成仿真数据（真实数据采集前的管线验证）
+python experiments/data_handling/simulate_iruwb.py \
+    --out-dir tmp/iruwb_raw --n-subjects 2 --hours 8
+
+# 2) 跑预处理（因果模式 = 实时分期用；换模式必须换输出目录）
+SLEEP_CAUSAL=1 python experiments/data_handling/preprocess_iruwb.py \
+    --raw-dir tmp/iruwb_raw --output-dir tmp/iruwb_processed_causal --n-workers 4
+
+# 非因果模式（复现作者口径，特征含未来信息）
+python experiments/data_handling/preprocess_iruwb.py \
+    --raw-dir tmp/iruwb_raw --output-dir tmp/iruwb_processed_leak --n-workers 4
+```
+
+调试时可 `--hours 1`，但预处理要加 `--min-sleep-epochs 20`
+（默认门槛 120 epoch = 2h 睡眠，与 MESA/SHHS 一致）。
+
+### 产出
+
+```
+<processed_dir>/
+  run_config.json                              # 模式锁 (causal 等)
+  checkpoint.json                              # 断点续跑
+  features_full_combined/features_combined<ID>.csv   # 560 列特征表
+  sleep_stages/sleep_stages<ID>.csv                  # 30s epoch 标签
+```
+
+### 三条支路
+
+| 模态 | 信号 → 方法 | 维数 | 13 槽位实取 |
+|---|---|---|---|
+| ACT | 原始信号 → `movement.extract_movement` → `actigraphy.calc_actigraph_features` | 370 | 1 |
+| HRV | 原始信号 → `beat_detection.detect_beats` → 两套口径并列 | 150 | 8 |
+| RRV | 原始信号 → `rrv.extract_rrv_features_helper` | 60 | 4 |
+
+HRV 同时产出两套口径（同一份拍表，两条实现）：
+
+| 口径 | 实现 | 列名 | 维数 |
+|---|---|---|---|
+| **MESA 口径** | `hrv.get_hrv_features_per_epoch` | `_hrv_*`（无窗口前缀） | 30 |
+| D04 口径 | `hrv.get_hrv_features` | `30_hrv_*` / `150_hrv_*` / … | 120 |
+
+**13 个训练槽位对齐 MESA 口径**，其中 HRV 槽位 3 用 `150_hrv_median_nni`：
+
+```
+ACT  _acc_mean_1
+HRV  _hrv_median_nni, _hrv_ratio_sd2_sd1, 150_hrv_median_nni,
+     _hrv_vlf, _hrv_lf, _hrv_hf, _hrv_lf_hf_ratio, _hrv_total_power
+RRV  150_RRV_MedianBB, 150_RRV_LF, 270_RRV_MCVBB, 150_RRV_CVBB
+```
+
+> MESA 的 HRV 列表第 1 与第 3 项历史上是同一个列名 `_hrv_median_nni`（重复项）；
+> 这里第 3 槽改用 150 s 窗口的 `150_hrv_median_nni`。
+>
+> `_hrv_*` 这 30 个列名与 MESA 实际保存的列集合**完全一致**（MESA 在保存前会
+> `del hr_features["_hrv_epoch"]`，所以要对比时应比对保存后的表）。
+
+`actigraphy.py` / `hrv.py` / `rrv.py` 是从 MESA/D04 对应模块**复制**的自包含副本
+（因为原版有脚本级全局变量依赖、只支持整数采样率、或缺少因果分支），
+非因果路径已验证与上游**列名一致、数值逐位一致**。
+
+### 验证工具
+
+```bash
+python experiments/evaluation/validate_iruwb_detectors.py [--quick]
+```
+
+在**合成数据**上报告：
+
+| | 内容 |
+|---|---|
+| [1] | 心搏检测的召回 / 精确 / RR 间期误差（分因果与非因果、含与不含运动） |
+| [2] | 检测带 × 心搏波形宽度的二维扫描 |
+| [3] | 逐 epoch 质量标记 |
+| [4][5] | HRV 7 个训练特征的端到端相对误差 |
+
+⚠️ 这些数字都是在合成信号上算的，衡量的是"检测器在仿真假设下工作得多好"，
+**不代表真机性能**。
+
+### 心搏检测流程与参数
+
+`preprocessing/iruwb/beat_detection.py::detect_beats`：
+
+```
+原始信号
+  → IIR 带通（Butterworth 4 阶，默认 0.5–3.33 Hz）
+  → 线性相位 FIR 带通（默认 61 tap，1.0–5.0 Hz）
+  → 峰值检测（不应期 0.3 s + 分位数阈值）
+  → 抛物线亚采样精修（把峰位精化到采样点之间，见下）
+  → 异常拍剔除（生理范围 + MAD）
+  → R_Peak_Idx / RR_Interval
+```
+
+| 参数 | 默认 | 含义 |
+|---|---|---|
+| `hr_bpm` | `(30, 200)` | IIR 带通的通带，用生理心率范围表示 |
+| `iir_order` | `4` | 每边 Butterworth 阶数 |
+| `fir_band_hz` | `(1.0, 5.0)` | FIR 通带。**下沿受抽头数硬约束**：因果 FIR 要做出某个下沿，抽头数得装得下至少一个周期的低频（0.5 Hz = 2 s = 40 样本 @20 Hz） |
+| `n_taps` | `61` | FIR 抽头数，群延迟 `(n_taps-1)//2` = 30 样本 = 1.5 s |
+| `causal` | 取 `processing_config.causal` | 因果滤波 + 滚动阈值 vs 零相位 + 全局阈值 |
+
+**这些取值都是在合成信号上调的，没有在真实数据上验证过。** 真实信号采集后应先观察
+实际频谱、心搏波形形态与 SNR，再重新评估。
+
+### 抛物线亚采样精修
+
+20 Hz 采样下 `argmax` 只能把峰位定到 50 ms 网格上。峰值附近信号可用抛物线近似
+（泰勒展开一次项为零），所以用峰及其左右邻点拟合抛物线、取顶点，即可得到**采样点
+之间**的位置：
+
+```
+δ = ½ · (y[i−1] − y[i+1]) / (y[i−1] − 2·y[i] + y[i+1])
+峰位 = i + δ        δ ∈ [−0.5, +0.5]
+```
+
+HRV 的 HF 频段（RSA 的物理来源）幅度就是几十毫秒量级，不做精修时 50 ms 的量化误差
+会与信号同量级。演示图：`python /tmp/demo_subsample_refinement.py`（生成两面板图，
+含单拍放大与"误差 vs 真值在网格中的相位"）。
+
+### 接入真机后先看什么
+
+1. **心搏分量的功率谱形状** —— 取安静睡眠期（无体动）算频谱：心搏能量落在哪个频段？
+   当前带通切掉多少？能否看到独立的心搏谱峰（而不是被呼吸谐波淹没）？
+2. **实际 SNR** —— 心搏分量 vs 安静期噪声底
+3. **心搏波形形态** —— 有没有可辨认的 J 峰，有多锐
+
+这三项决定当前这套参数是否适用。若心搏分量始终在噪声之下，可能需要换方法
+（多拍平均 / 模板匹配），或接受不作 HRV。
+
 ## 后台训练（screen）
 
 ```bash

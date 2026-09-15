@@ -47,3 +47,4 @@ exports_our/
 /.idea/inspectionProfiles/Project_Default.xml
 /.idea/sleep-analysis.iml
 /.idea/vcs.xml
+tmp/
