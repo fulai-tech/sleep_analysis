@@ -40,6 +40,10 @@ from hrvanalysis import (
 
 import sleep_analysis.processing_config as pc
 
+# 一个 epoch 内至少多少 RR 间期才算 HRV —— 与 MESA 一致
+# (``preprocessing/rr_utils.py``: ``t1[t1["count"] < 10]`` 的 epoch 整块剔除)
+MIN_RR_PER_EPOCH = 10
+
 
 def overlapping_windows(df: pd.DataFrame, window_seconds: int,
                         causal: Optional[bool] = None) -> dict:
@@ -149,7 +153,7 @@ def get_hrv_features_windows(r_peak_df: pd.DataFrame, window: int,
 
 def get_hrv_features_per_epoch(peaks_df: pd.DataFrame,
                                epoch_index: pd.DatetimeIndex,
-                               min_rr: int = 5) -> pd.DataFrame:
+                               min_rr: int = MIN_RR_PER_EPOCH) -> pd.DataFrame:
     """**MESA 口径**的 HRV: 每个 30 s epoch 内各自的 RR 间期上算, 不做滑动窗口。
 
     与同文件的 ``get_hrv_features``（**D04 口径**, 30/150/210/270 s 滑动窗口,
@@ -165,14 +169,16 @@ def get_hrv_features_per_epoch(peaks_df: pd.DataFrame,
     epoch_index : pd.DatetimeIndex
         输出的 30 s epoch 时间轴; 每拍按其所在 epoch 归组。
     min_rr : int
-        一个 epoch 内至少多少 RR 间期才算特征, 不足则留空（后续填 0）。
-        MESA 原版用 ``if tmp_hr_df.size > 3`` —— ``DataFrame.size`` 是**行×列**,
-        那个条件恒真, 起不到过滤作用。这里用有意义的拍数下限。
+        一个 epoch 内至少多少 RR 间期才算特征。**默认 10, 与 MESA 一致**
+        （``rr_utils.py``: ``t1[t1["count"] < 10]`` 的 epoch 整块剔除）。
+        不足的 epoch 整行留 **NaN**, 由 ``pipeline.process_signal`` 剔除
+        —— **不填 0**: 填 0 会让 ``_hrv_median_nni = 0 ms`` 这种物理上不可能的
+        值被当成测量值喂进模型。
 
     Returns
     -------
     pd.DataFrame
-        行 = epoch, 列 = ``_hrv_*``（30 个）。
+        行 = epoch, 列 = ``_hrv_*``（30 个）。拍数不足的 epoch 整行为 NaN。
     """
     ep_of_beat = peaks_df.index.floor("30s")
     rr_ms = peaks_df["RR_Interval"].to_numpy() * 1000.0     # hrvanalysis 要毫秒
@@ -196,7 +202,9 @@ def get_hrv_features_per_epoch(peaks_df: pd.DataFrame,
     df = pd.DataFrame(rows).T.reindex(epoch_index)
     if "tinn" in df.columns:                 # 恒为 None
         df = df.drop(columns=["tinn"])
-    df = df.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    # inf → 0 (与 MESA 一致); **NaN 保留** —— 那是"该 epoch 没有可用 HRV"的标记,
+    # 由调用方剔除整行, 不能填成 0 冒充测量值。
+    df = df.replace([np.inf, -np.inf], 0.0)
     df.columns = ["_hrv_" + str(c) for c in df.columns]
     return df
 

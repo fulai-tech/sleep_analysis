@@ -94,10 +94,22 @@ def process_one_subject(cfg: dict):
             return (subj, False, {"reason": "no labels file"})
         labels = pd.read_csv(labels_path)
 
-        # 标签与特征按 epoch 序号对齐取交集
-        n = min(len(features), len(labels))
+        # 标签按 **epoch 序号** 对齐, 不按行位置 —— 管线会剔除拍数不足的 epoch,
+        # 两边行数不再相等, 按位置截断会错位。
+        # features 的索引是 epoch 时间轴, 起点 = floor(录制起点, 30s),
+        # 而 labels 的 epoch 列是从录制起点开始的 0-based 序号。
+        ep0 = pd.Timestamp(start_time).floor("30s")
+        ordinals = ((features.index - ep0).total_seconds() / 30.0).round().astype(int)
+        oob = (ordinals < 0) | (ordinals >= len(labels))
+        if oob.any():
+            return (subj, False,
+                    {"reason": f"{int(oob.sum())} 个 epoch 序号超出标签范围 "
+                               f"(0..{len(labels)-1}), 特征与标签时间轴不匹配"})
+        labels = labels.iloc[ordinals].reset_index(drop=True)
+
+        n = len(features)
         if n == 0:
-            return (subj, False, {"reason": "no overlapping epochs"})
+            return (subj, False, {"reason": "no epochs after filtering"})
         # 睡眠时长门槛与 MESA/SHHS 保持一致 (默认 >2h 睡眠 = 120 epoch)
         sleep_n = int(pd.to_numeric(labels["sleep"], errors="coerce").fillna(0).to_numpy()[:n].sum())
         if sleep_n <= cfg["min_sleep_epochs"]:
@@ -107,8 +119,8 @@ def process_one_subject(cfg: dict):
         out_feat = processed_dir / "features_full_combined" / f"features_combined{subj}.csv"
         out_lab = processed_dir / "sleep_stages" / f"sleep_stages{subj}.csv"
         # index=True 与 MESA/SHHS 的约定一致: 训练端用 index_col=0 消费
-        features.iloc[:n].to_csv(out_feat, index=True)
-        labels.iloc[:n].to_csv(out_lab, index=False)
+        features.to_csv(out_feat, index=True)
+        labels.to_csv(out_lab, index=False)
 
         elapsed = time.time() - t0
         return (subj, True, {

@@ -77,6 +77,10 @@ MIN_BEAT_DISTANCE_S = 0.30   # 不应期
 HEIGHT_PERCENTILE = 90.0
 CAUSAL_WINDOW_S = 300.0
 
+# 因果剔除（统计离群规则）用的尾部窗口长度, 单位是**拍数**不是秒。
+# 300 拍 ≈ 5 min @60bpm, 与 CAUSAL_WINDOW_S 同一量级。
+OUTLIER_WINDOW_BEATS = 300
+
 # 一个 epoch 内至少多少拍才认为 HRV 可用（与 MESA 路径的 ">=10 RR" 一致）
 MIN_BEATS_PER_EPOCH = 10
 
@@ -260,13 +264,54 @@ def _refine_subsample(filt: np.ndarray, peaks: np.ndarray) -> np.ndarray:
     return out
 
 
-def _remove_outliers(peak_times: np.ndarray, mad_k: float = 3.0) -> Tuple[np.ndarray, int]:
+def _rolling_median_mad(rr: np.ndarray, window_beats: int) -> Tuple[np.ndarray, np.ndarray]:
+    """因果的滚动 median 与 MAD（只用已见数据）。
+
+    开头样本不足一个窗口时用扩展窗口（expanding），之后切尾部固定长度窗口
+    —— 与 ``_rolling_percentile`` 同一套路。
+    """
+    s = pd.Series(rr)
+    w = min(max(2, int(window_beats)), len(rr))
+    med = s.expanding(min_periods=1).median().to_numpy()
+    if len(rr) > w:
+        med[w:] = s.rolling(w, min_periods=1).median().to_numpy()[w:]
+    dev = pd.Series(np.abs(rr - med))
+    mad = dev.expanding(min_periods=1).median().to_numpy()
+    if len(rr) > w:
+        mad[w:] = dev.rolling(w, min_periods=1).median().to_numpy()[w:]
+    return med, mad
+
+
+def _remove_outliers(peak_times: np.ndarray, mad_k: float = 3.0,
+                     causal: Optional[bool] = None) -> Tuple[np.ndarray, int]:
     """剔除生理范围外和统计离群的拍。
 
     两条规则:
-      1. 生理范围: 相邻间隔须在 ``[MIN_RR_S, MAX_RR_S]`` 内
-      2. 统计离群: 间隔偏离中位数超过 ``mad_k`` 倍 MAD（1.4826 缩放到 σ 口径）
+      1. **生理范围**: 相邻间隔须在 ``[MIN_RR_S, MAX_RR_S]`` 内 —— 只看相邻两拍,
+         本身就是因果的。
+      2. **统计离群**: 间隔偏离中位数超过 ``mad_k`` 倍 MAD（1.4826 缩放到 σ 口径）。
+
+    ⚠️ **规则 2 的统计量必须随 ``causal`` 分支**, 否则流式推理无法复现离线特征:
+    同一段前缀信号「单独跑」与「接上后续数据跑」, 保留的拍会不一样 ——
+    因为整夜的 median/MAD 会随后续数据变化。
+
+    实测不可复现的峰占比（前缀 vs 全量, 排除边界效应）::
+
+        干净信号            0.06%
+        3x 噪声 + 6 体动/h   0.57%
+        3x 噪声 + 30 体动/h  1.80%
+
+    即信号越差、体动越多, 差异越大。
+
+    Parameters
+    ----------
+    causal : bool, optional
+        None 时取 ``processing_config.causal``。
+        False = 整夜 median/MAD（与 D04 口径一致）;
+        True  = 尾部滚动 median/MAD（窗口 ``OUTLIER_WINDOW_BEATS`` 拍）。
     """
+    if causal is None:
+        causal = pc.causal
     if len(peak_times) < 3:
         return peak_times, 0
     rr = np.diff(peak_times)
@@ -274,25 +319,39 @@ def _remove_outliers(peak_times: np.ndarray, mad_k: float = 3.0) -> Tuple[np.nda
     bad = (rr < MIN_RR_S) | (rr > MAX_RR_S)
     keep[1:][bad] = False
 
-    good_rr = rr[~bad]
-    if len(good_rr) >= 5:
-        med = np.median(good_rr)
-        mad = np.median(np.abs(good_rr - med))
-        if mad > 1e-9:
-            keep[1:][np.abs(rr - med) > mad_k * 1.4826 * mad] = False
+    if causal:
+        med, mad = _rolling_median_mad(rr, OUTLIER_WINDOW_BEATS)
+        ok = mad > 1e-9
+        keep[1:][ok & (np.abs(rr - med) > mad_k * 1.4826 * mad)] = False
+    else:
+        good_rr = rr[~bad]
+        if len(good_rr) >= 5:
+            med = np.median(good_rr)
+            mad = np.median(np.abs(good_rr - med))
+            if mad > 1e-9:
+                keep[1:][np.abs(rr - med) > mad_k * 1.4826 * mad] = False
     return peak_times[keep], int((~keep).sum())
 
 
 def _rr_from_positions(peak_pos: np.ndarray, fs: float) -> np.ndarray:
-    """由（亚采样）峰位计算 RR 间隔（秒）。
+    """由（亚采样）峰位计算 RR 间期（秒）。
 
-    最后一拍用前序中位数填充（避免末拍产生一个虚假的短间隔）。
+    **归属约定与 MESA 一致**: ``rr[i] = t[i] − t[i−1]``，即每个 RR 间期挂在它的
+    **后一拍**上。第一拍没有前驱，用全部间期的均值填充
+    （MESA ``preprocessing/rr_utils.py``: ``seconds.diff()`` 后 ``fillna(mean)``）。
+
+    ⚠️ **D04 用的是相反约定**（``empkins_micro.get_rpeaks`` 里
+    ``np.ediff1d(..., to_end=0)``）：挂在**前一拍**上，最后一拍填均值。
+    两种约定下，每个 30 s epoch 取的间期集合会错开一拍 —— 实测 HRV 逐 epoch
+    特征差异: ``median_nni`` 0.00%（中位数对平移不敏感）, ``lf`` 1.7%（受影响最大）。
+    这里选 MESA 约定，因为 13 个训练槽位以 MESA 为准。
+
     **亚采样精度在这里体现**：直接用整数下标做差会丢掉精修的全部收益。
     """
     if len(peak_pos) < 2:
         return np.zeros(len(peak_pos))
-    rr = np.diff(peak_pos) / fs
-    return np.append(rr, np.median(rr))
+    rr = np.diff(peak_pos) / fs                     # rr[k] = t[k+1] − t[k]
+    return np.concatenate([[rr.mean()], rr])        # 前置 → rr[i] = t[i] − t[i−1]
 
 
 def detect_beats(signal: np.ndarray, fs: float,
@@ -324,7 +383,9 @@ def detect_beats(signal: np.ndarray, fs: float,
     height_percentile : float
         检测阈值分位数。
     causal : bool, optional
-        是否用因果滤波 + 因果阈值。默认取 ``processing_config.causal``。
+        是否走全因果路径。默认取 ``processing_config.causal``。
+        True 时**四步全部因果**: 滤波（``lfilter``）、检测阈值（滚动分位）、
+        群延迟补偿、异常拍剔除（滚动 median/MAD）。
     refine : bool
         是否做抛物线亚采样精修。
     remove_outliers : bool
@@ -339,6 +400,16 @@ def detect_beats(signal: np.ndarray, fs: float,
     if causal is None:
         causal = pc.causal
     signal = np.asarray(signal, dtype=float).ravel()
+
+    # NaN 守卫: IIR 滤波是递归的, 会把一个 NaN 扩散到其后**所有**样本;
+    # 非因果分支的 filtfilt（前向+反向两遍）更是前后双向扩散。
+    # 实测注入单个 NaN: 非因果分支检出 0 拍（整夜全废）, 因果分支只剩前半段。
+    n_nan = int(np.isnan(signal).sum())
+    if n_nan:
+        raise ValueError(
+            f"输入信号含 {n_nan} 个 NaN —— IIR 滤波会把它扩散到其后所有样本。"
+            f"请先用 ``pipeline.fill_signal_nans`` 补齐（或自行插值）。"
+        )
 
     chain = build_filter_chain(fs, hr_bpm, iir_order, fir_band_hz, n_taps)
     filt = apply_filter_chain(signal, chain, causal)
@@ -357,7 +428,7 @@ def detect_beats(signal: np.ndarray, fs: float,
 
     n_removed = 0
     if remove_outliers:
-        kept, n_removed = _remove_outliers(peak_times)
+        kept, n_removed = _remove_outliers(peak_times, causal=causal)
         mask = np.isin(peak_times, kept)
         peak_pos, peak_times = peak_pos[mask], peak_times[mask]
 

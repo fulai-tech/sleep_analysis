@@ -46,7 +46,7 @@ import sleep_analysis.processing_config as pc
 from sleep_analysis.preprocessing.iruwb.actigraphy import calc_actigraph_features
 from sleep_analysis.preprocessing.iruwb.beat_detection import BeatDetectionResult, detect_beats
 from sleep_analysis.preprocessing.iruwb.hrv import (
-    get_hrv_features, get_hrv_features_per_epoch,
+    MIN_RR_PER_EPOCH, get_hrv_features, get_hrv_features_per_epoch,
 )
 from sleep_analysis.preprocessing.iruwb.movement import extract_movement
 from sleep_analysis.preprocessing.iruwb.rrv import extract_rrv_features_helper
@@ -65,6 +65,50 @@ class PipelineDiagnostics:
     epoch_index: pd.DatetimeIndex
 
 
+def fill_signal_nans(signal: np.ndarray):
+    """线性插值补齐输入信号里的 NaN，返回 ``(补齐后的信号, 填补数量)``。
+
+    真实采集丢一个采样点就会产生 NaN。若不处理，下游的 IIR 滤波
+    （Butterworth，递归）会把 NaN 扩散到其后**所有**样本；非因果分支的
+    ``filtfilt``（前向 + 反向两遍）更是**前后两个方向都扩散** —— 实测注入
+    单个 NaN 就能让整夜检出 0 拍。
+
+    ``pandas.interpolate`` 对首尾 NaN 用最近有效值外推；若整段无有效值则抛错。
+    """
+    signal = np.asarray(signal, dtype=float).ravel()
+    n_nan = int(np.isnan(signal).sum())
+    if n_nan == 0:
+        return signal, 0
+    filled = pd.Series(signal).interpolate(limit_direction="both").to_numpy()
+    if np.isnan(filled).any():
+        raise ValueError(f"输入信号含 {n_nan} 个 NaN 且无有效样本可插值")
+    return filled, n_nan
+
+
+def validate_blocks(features: pd.DataFrame) -> None:
+    """校验三条支路各自产出了预期数量的列，否则抛错。
+
+    **不做这一步的话，退化输入会让整块特征静默消失。** 实测：呼吸信号无峰时
+    （恒定/斜坡），RRV 三个窗口全部抛异常，``dict.fromkeys([], 0)`` 产出空 dict，
+    最终 RRV 的 60 列**一列不剩** —— 特征表从 581 列变 521 列，而
+    ``process_signal`` 照常返回，不报任何错。下游按列名取特征时才 KeyError。
+
+    同样的机制也会让 HRV 逐 epoch 块（30 列）在无可用心搏时消失。
+    """
+    groups = [
+        ("ACT", [c for c in features.columns if c.startswith("_acc")], 370),
+        ("HRV(逐epoch)", [c for c in features.columns if c.startswith("_hrv")], 30),
+        ("RRV", [c for c in features.columns if "RRV" in c], 60),
+    ]
+    bad = [(n, len(c), e) for n, c, e in groups if len(c) != e]
+    if bad:
+        detail = "; ".join(f"{n} 产出 {got} 列/预期 {exp} 列" for n, got, exp in bad)
+        raise ValueError(
+            f"特征支路产出异常（{detail}）—— 输入信号可能退化"
+            f"（呼吸无峰 / 无可用心搏）。请检查上游信号质量。"
+        )
+
+
 def make_epoch_index(start_time, n_samples: int, fs: float) -> pd.DatetimeIndex:
     """构造与信号等长的采样级时间轴, 以及对齐到 30 s 的 epoch 轴。"""
     t = pd.Timestamp(start_time).floor("30s") + pd.to_timedelta(
@@ -79,6 +123,8 @@ def epoch_axis(sample_index: pd.DatetimeIndex) -> pd.DatetimeIndex:
 
 
 def process_signal(signal: np.ndarray, fs: float, start_time,
+                   min_beats_per_epoch: int = MIN_RR_PER_EPOCH,
+                   max_bad_epoch_frac: float = 0.2,
                    thr_resp_variability_warn: bool = True) -> tuple:
     """跑完整管线, 返回 (特征表, 诊断信息)。
 
@@ -90,6 +136,11 @@ def process_signal(signal: np.ndarray, fs: float, start_time,
         采样率。
     start_time : datetime-like
         录制起始时刻, 决定 epoch 时间轴。
+    min_beats_per_epoch : int
+        一个 epoch 内至少多少 RR 间期才算 HRV。不足的 epoch **整行剔除**
+        （与 MESA 一致），而不是填 0。
+    max_bad_epoch_frac : float
+        可容忍的剔除比例上限，超过则抛错（该被试数据质量不足）。
     thr_resp_variability_warn : bool
         当呼吸特征在某窗口全部被填 0 时打印警告（提示信号质量问题）。
 
@@ -98,8 +149,15 @@ def process_signal(signal: np.ndarray, fs: float, start_time,
     (features, diag)
         ``features`` 为合并后的特征表（索引 = epoch 时间轴）,
         ``diag`` 为 ``PipelineDiagnostics``。
+
+    Raises
+    ------
+    ValueError
+        输入信号退化（NaN 无法补齐 / 某支路产出列数异常 / 剔除 epoch 过多）。
     """
-    signal = np.asarray(signal, dtype=float).ravel()
+    signal, n_filled = fill_signal_nans(signal)
+    if n_filled:
+        print(f"  [WARN] 输入信号有 {n_filled} 个 NaN 样本, 已线性插值补齐", flush=True)
     sample_index = make_epoch_index(start_time, len(signal), fs)
     ep_index = epoch_axis(sample_index)
 
@@ -117,7 +175,7 @@ def process_signal(signal: np.ndarray, fs: float, start_time,
     # 两套口径都算:
     #   per-epoch (_hrv_*)      —— MESA 口径, 训练 13 槽位里的 7 个取自这里
     #   windowed  (150_hrv_* …) —— D04 口径, 槽位 3 (150_hrv_median_nni) 取自这里
-    hrv_epoch = get_hrv_features_per_epoch(peaks_df, ep_index)
+    hrv_epoch = get_hrv_features_per_epoch(peaks_df, ep_index, min_rr=min_beats_per_epoch)
     hrv_win = get_hrv_features(peaks_df, epoch_index=ep_index)
     hrv_win.index = ep_index
     hrv_features = pd.concat([hrv_epoch, hrv_win], axis=1)
@@ -138,6 +196,21 @@ def process_signal(signal: np.ndarray, fs: float, start_time,
             "HRV 最长窗口 270 s 都需要足够的上下文。"
         )
 
+    # 剔除拍数不足的 epoch —— HRV 逐 epoch 块整行为 NaN 即该标记。
+    # 与 MESA 一致（rr_utils.py 里把 count < 10 的 epoch 整块删掉），
+    # 而不是填 0 让 "median_nni = 0 ms" 这种非物理值混进特征表。
+    bad = hrv_epoch.reindex(common).isna().all(axis=1).to_numpy()
+    n_bad = int(bad.sum())
+    if n_bad:
+        frac = n_bad / len(common)
+        msg = (f"剔除 {n_bad}/{len(common)} ({frac:.1%}) 个 epoch"
+               f"（RR 间期 < {min_beats_per_epoch}）")
+        if frac > max_bad_epoch_frac:
+            raise ValueError(
+                f"{msg} —— 超过上限 {max_bad_epoch_frac:.0%}, 该被试信号质量不足")
+        print(f"  [INFO] {msg}", flush=True)
+        common = common[~bad]
+
     merged = pd.concat([
         act_features.loc[common].reset_index(drop=True),
         hrv_features.loc[common].reset_index(drop=True),
@@ -146,6 +219,8 @@ def process_signal(signal: np.ndarray, fs: float, start_time,
     # 重复列名（如 HRV 列表里历史上重复的 _hrv_median_nni）去重
     merged = merged.loc[:, ~merged.columns.duplicated()]
     merged.index = common
+
+    validate_blocks(merged)      # 分支退化时抛错, 不让整块特征静默消失
 
     if thr_resp_variability_warn:
         resp_cols = [c for c in merged.columns if "RRV" in c]
