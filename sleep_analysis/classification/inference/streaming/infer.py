@@ -171,6 +171,10 @@ class StreamingInferenceEngine:
         # ⚠️ 必须在 `input_layout` 之后 —— `_resolve_norm` 用它校验列数。
         self._norm_mean, self._norm_std = self._resolve_norm(baseline, ckpt)
 
+        # 被试内恒定的列（`_has_*` 标志）—— 见 `predict` 里的归零说明
+        self._const_cols = [j for j, c in enumerate(self.input_layout)
+                            if c.startswith("_has_")]
+
         flags = {"_has_act": 1.0, "_has_hrv": 1.0, "_has_rrv": 1.0}
         if flag_values:
             flags.update(flag_values)
@@ -287,6 +291,15 @@ class StreamingInferenceEngine:
         # ⚠️ `+1e-5` 必须与训练时一致（`model.py` 的 `std_x = x.std(...) + 1e-5`）。
         if self._norm_mean is not None:
             x = (x - self._norm_mean) / (self._norm_std + 1e-5)
+            # ⚠️⚠️ **常数列必须显式归零**。
+            #   训练时 `internal_norm` 的统计量是**每个 batch 单独算**的，而一个 batch
+            #   约等于一个被试 —— 对 `_has_*` 这种被试内恒定的列，batch 内 std = 0，
+            #   于是 `(x − x)/(0 + 1e-5) = 0`：**这一列进模型时恒为 0**。
+            #   部署用的是"std 的平均值"（`_has_act` 为 0.000118，因为 87% 的被试没有 ACT），
+            #   配上 mean≈0 就变成 `2.51 / 0.000118 ≈ 19607` —— 量级完全错的输入喂进 LSTM。
+            #   （实测：修之前 `_has_act` 归一化成 19607，训练时是 0。）
+            if self._const_cols:
+                x[:, :, self._const_cols] = 0.0
 
         logits = self.session.run([self._output_name], {self._input_name: x})[0][0]
 
