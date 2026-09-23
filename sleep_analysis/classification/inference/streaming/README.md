@@ -59,6 +59,65 @@ epoch 网格: k×30 − 1.55 秒（偏移 1.55 s = FIR 群延迟 1.5 s + 峰确�
 | `hrv.py` | HRV 特征 | `hrvanalysis` 的 7 个特征 |
 | `resp.py` | 呼吸峰检测 + RRV 特征 | `neurokit2` 的 biosppy 路径 + 4 个 RRV 特征 |
 | `prep.py` | 13 槽位编排 + `StreamingPreprocessor` | — |
+| `infer.py` | 13 维特征 → 补 `_has_*` 标志 → scaler → ONNX → 分期 | — |
+
+## 完整链路（部署形态）
+
+```
+900 s 原始波形 @20 Hz
+   → StreamingPreprocessor.update()        → (21, 13) 特征
+   → StreamingInferenceEngine.build_input() → (1, 21, 16)   ← 补 _has_* 标志
+   → scaler（训练集 mean/scale，逐 epoch）
+   → model.onnx（NPU / onnxruntime）        → logits (4,)
+   → argmax                                 → 分期 + 时间戳
+```
+
+**ONNX 导出**：`python sleep_analysis/classification/inference/export_onnx.py --run-dir <run_dir>`
+
+### 部署变体：`internal_norm` 移到图外
+
+模型 `config.internal_norm=true` 时，图里的 `x.mean(dim=(0,1))` 统计量**跟着 batch 组成走**
+（训练 512 窗/批 vs 流式 1 窗/批，实测同一段特征 logits 差 0.128）。
+
+部署方案（2026-09-17 定）：把这一层**移出图外**，用**固定参数**替代 ——
+第一晚用**训练集平均基线**，之后逐日更新为该被试自己的基线，越用越准。
+
+```bash
+# 1. 统计训练集基线（5516 人 / 5,696,506 窗，约 1 分钟）
+python experiments/evaluation/fit_internal_norm_baseline.py --run-dir <run_dir>
+
+# 2. 导出图外归一化变体
+python sleep_analysis/classification/inference/export_onnx.py \
+    --run-dir <run_dir> --no-internal-norm \
+    --output <run_dir>/checkpoints/model_deploy.onnx
+```
+
+`StreamingInferenceEngine` 会**自动优先加载** `model_deploy.onnx` 并启用图外归一化
+（也可用 `baseline=` 传入该被试自己的基线）。
+
+⚠️ **产出目录里只保留 `model_deploy.onnx` 这一个模型文件。**
+含图内 `internal_norm` 的 `model.onnx` **不保留** —— 它看起来像主产物，却是
+**不该部署**的那个（统计量跟着 batch 走），留着只会让人误判。需要做"图内 vs 图外"
+对照时，验证脚本直接用 PyTorch 现算，不依赖那个文件。
+
+**实测**：部署变体 batch=1 vs batch=4 的 logits **逐位一致（差 0）**，
+与 PyTorch 同参数下差 2.4e-7（1 ULP）。
+
+⚠️ 基线脚本有**自检**：`E[窗内均值]` 缩放后必须 ≈ 0（由 scaler 的拟合方式决定）。
+全量跑出来是 2.5e-14，且窗口总数 5,696,506 与训练日志的 `x_train` 形状完全一致。
+
+⚠️ 导出有三个坑（都已修在 `export_onnx.py` 里）：
+1. **`--missing-mode` 的模型**要为每个模态多算一列 `_has_*`，否则 `input_size` 算成 13
+   而 checkpoint 是 16 → `load_state_dict` 直接报 size mismatch
+2. **torch ≥ 2.6 默认走 dynamo 导出器**，它依赖 `onnxscript`（不在本项目依赖里）。
+   脚本会自动降级到旧 TorchScript 导出器
+3. **ONNX IR 版本默认不是 9** —— torch 按 opset 自动选（`opset 17 → IR 8`，
+   `opset 18 → IR 10`），端侧 runtime 要求的可能是别的值。
+   用 `--ir-version`（**默认 9**）指定。
+   ⚠️ IR 与 opset 是两回事：**opset 管算子语义、IR 管 proto schema**。
+   **只往高改安全**（IR 9 是 IR 8 的超集），往低改可能让模型已用到的字段失效
+
+**验证**：`python experiments/evaluation/verify_streaming_end2end.py`（5 项）
 
 **滤波系数是硬编码常量**（不是运行时设计），Python 与 C++ 共用同一组数值。
 生成命令写在 `filters.py` 顶部。

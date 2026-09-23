@@ -32,6 +32,26 @@ for _ in range(8):
 sys.path.insert(0, str(_PROJECT_ROOT))
 
 
+def _exporter_kwargs() -> dict:
+    """选择 ONNX 导出器。
+
+    ✅2026-09-17: torch >= 2.6 的 `torch.onnx.export` **默认走 dynamo 新导出器**,
+    而新导出器依赖 `onnxscript`。该包不在本项目依赖里, 直接调用会
+    `ModuleNotFoundError: No module named 'onnxscript'` —— 报错发生在 torch 内部,
+    与模型/参数无关, 容易误判。
+
+    这里自动探测: 有 `onnxscript` 就用新导出器; 没有则退回旧 TorchScript 导出器
+    (`dynamo=False`), 两者产出的图语义一致（本项目用的是普通 LSTM + Linear 组合,
+    无旧导出器不支持算子）。旧导出器在新版 torch 里已标记废弃, 若要长期使用
+    请 `pip install onnxscript`。
+    """
+    import importlib.util
+    if importlib.util.find_spec("onnxscript") is not None:
+        return {}
+    print("  [INFO] 未安装 onnxscript → 使用旧版 TorchScript 导出器 (dynamo=False)")
+    return {"dynamo": False}
+
+
 def main():
     parser = argparse.ArgumentParser(description="导出 ONNX 模型")
     parser.add_argument("--run-dir", type=str, required=True,
@@ -42,6 +62,14 @@ def main():
                         help="序列长度 (默认从 config.json 读取)")
     parser.add_argument("--opset", type=int, default=17,
                         help="ONNX opset 版本 (default: 17)")
+    parser.add_argument("--ir-version", type=int, default=9,
+                        help="ONNX IR 格式版本（默认 9，端侧 runtime 的要求）。"
+                             "不指定时 torch 会按 opset 自动选（opset 17 → IR 8）。"
+                             "注意 IR 与 opset 是两回事：opset 管算子语义，IR 管 proto schema")
+    parser.add_argument("--no-internal-norm", action="store_true",
+                        help="强制不把 internal_norm 放进图（部署用）。归一化改在图外做, "
+                             "参数可替换（第一晚用训练集基线, 之后用被试自己的基线）。"
+                             "见 experiments/evaluation/fit_internal_norm_baseline.py")
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -62,10 +90,27 @@ def main():
     dropout = config["dropout"]
     stateful = config.get("stateful", False)  # ✅2026-08-11: 有状态模型导出单步 scan 图
     internal_norm = config.get("internal_norm", False)  # ✅2026-08-14: 旧版内部归一化 (复现基线)
+    if args.no_internal_norm:
+        # ✅2026-09-17: 部署变体 —— 归一化移出图外。图内的呢一层统计量跟着 batch 走
+        #   （训练 512 窗/批 vs 流式 1 窗/批，实测 logits 差 0.128），移出去之后
+        #   用固定参数（训练集基线 / 被试基线）替代, 图本身与 batch 无关。
+        if internal_norm:
+            print("  [INFO] --no-internal-norm: 图中不包含 internal_norm（归一化需在图外做）")
+        internal_norm = False
 
     # 2. 计算 input_size
     from sleep_analysis.classification.deep_learning.utils import get_num_input, get_num_classes
     input_size = get_num_input(modality)
+    # ✅2026-09-17: --missing-mode 的模型为每个模态多一列 `_has_<模态>` 标志
+    #   （布局 `[ACT..., _has_act, HRV..., _has_hrv, RRV..., _has_rrv]`，
+    #   见 data_peparation.py::_extract_subj_features_raw）。
+    #   不加这一段会得到 input_size=13，与 checkpoint 的 16 不匹配 →
+    #   `load_state_dict` 直接报 size mismatch。模型仍可导出（图是对的），
+    #   但**权重加载不进去**，是个静默的坑：报错信息只说 shape 不符，
+    #   不提示是 missing_mode 造成的。EDR 不加标志（训练侧如此）。
+    missing_mode = config.get("missing_mode", False)
+    if missing_mode:
+        input_size += sum(1 for m in modality if m in ("ACT", "HRV", "RRV"))
     num_classes = get_num_classes(classification_type)
 
     print(f"Config:")
@@ -74,6 +119,7 @@ def main():
     print(f"  input_size: {input_size}, hidden: {hidden_size}, layers: {num_layers}")
     print(f"  seq_len: {seq_len}, num_classes: {num_classes}")
     print(f"  stateful: {stateful}")
+    print(f"  internal_norm: {internal_norm}   missing_mode: {missing_mode}")
 
     # 3. 构建模型并加载权重
     from sleep_analysis.classification.deep_learning.lstm.model import Model
@@ -91,8 +137,21 @@ def main():
             # (外部 scaler 作为唯一归一化, 在 Python 侧应用; 归一化不进入 ONNX 图)
             # ✅2026-08-14: --internal-norm 时按旧版行为把归一化重新放进图 (复现 08-06 基线)
             if self.use_internal_norm:
+                # ✅2026-09-17: 把 `std` 展开成显式的 ddof=1, 不直接用 `x.std(dim=(0,1))`。
+                #   PyTorch 的 `std` 默认 `unbiased=True`（ddof=1）; **dynamo 导出器**
+                #   在 ONNX 里没有对等算子, 只能近似成 ddof=0（见 model.py:124 记录的老问题）,
+                #   两者相差 √(n/(n-1))。显式展开只用导出器能忠实表达的算子, 对新旧
+                #   导出器都安全。
+                #   ⚠️ 实测: **旧 TorchScript 导出器本来就正确处理了 `std`**（与 PyTorch
+                #      差 ~2.4e-7 = 1 ULP）, 所以这条对当前环境不是必需的修复, 是防御性的。
+                #      `internal_norm` 真正的数值坑在别处: **常量列**（`_has_*`）的
+                #      `(x−mean)` 本应为 0, 归约顺序差 1 ULP 后被 `+1e-5` 放大 1e5 倍
+                #      → ONNX 与 PyTorch 差 2.3e-2。见
+                #      experiments/evaluation/verify_streaming_end2end.py 的 [2]。
                 mean_x = x.mean(dim=(0, 1), keepdim=True)
-                std_x = x.std(dim=(0, 1), keepdim=True) + 1e-5  # Avoid division by zero
+                _n = x.shape[0] * x.shape[1]
+                _var = ((x - mean_x) ** 2).sum(dim=(0, 1), keepdim=True) / (_n - 1)
+                std_x = torch.sqrt(_var) + 1e-5  # Avoid division by zero
                 x = (x - mean_x) / std_x
 
             h_0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size, device=x.device)
@@ -205,6 +264,7 @@ def main():
             input_names=["x", "h", "c", "buf"],
             output_names=["logits", "h_n", "c_n", "buf_out"],
             dynamic_axes=dynamic_axes,
+            **_exporter_kwargs(),
         )
     else:
         # 动态 batch 维度，固定 seq_len 和 input_size
@@ -223,6 +283,7 @@ def main():
             input_names=["input"],
             output_names=["output"],
             dynamic_axes=dynamic_axes,
+            **_exporter_kwargs(),
         )
 
     print(f"\n  ONNX model saved to: {output_path}")
@@ -236,8 +297,21 @@ def main():
         onnx.save(onnx_model, str(output_path))
         print(f"  External data merged → single file ({output_path.stat().st_size / 1024 / 1024:.1f} MB)")
 
-    # 6. 验证
+    # 5c. 指定 ONNX IR 版本
+    #   torch 按 opset 自动选 IR（opset 17 → IR 8），端侧 runtime 可能要别的值。
+    #   ⚠️ 只往高改安全（IR 9 是 IR 8 的超集）；往低改可能让模型里用到的字段失效。
     import onnx
+    if args.ir_version:
+        _m = onnx.load(str(output_path))
+        _auto = _m.ir_version
+        if _auto != args.ir_version:
+            _m.ir_version = args.ir_version
+            onnx.save(_m, str(output_path))
+            print(f"  IR version: {_auto} → {args.ir_version}（自动值 → 指定值）")
+        else:
+            print(f"  IR version: {_auto}（与指定值一致）")
+
+    # 6. 验证
     onnx_model = onnx.load(str(output_path))
     onnx.checker.check_model(onnx_model)
     print(f"  ONNX model verified: OK")
@@ -260,7 +334,7 @@ def main():
         onnx_outs = session.run(None, feed)
         for i, (to, oo) in enumerate(zip(torch_outs, onnx_outs)):
             d = np.max(np.abs(to - oo))
-            print(f"  output[{i}] max diff: {d:.6f}")
+            print(f"  output[{i}] max diff: {d:.3e}")
         max_diff = max(np.max(np.abs(a - b)) for a, b in zip(torch_outs, onnx_outs))
     else:
         # PyTorch 输出
@@ -274,7 +348,9 @@ def main():
         print(f"  PyTorch output: {torch_out.flatten()[:5]}...")
         print(f"  ONNX output:    {onnx_out.flatten()[:5]}...")
 
-    print(f"  Max diff: {max_diff:.6f}")
+    # ⚠️ 用科学计数法: 旧版是 `:.6f`, 任何 < 5e-7 的差异都会显示成 "0.000000",
+    #    让人误以为逐位一致（实际 internal_norm 的 std 约定差异能到 1e-2 量级）。
+    print(f"  Max diff: {max_diff:.3e}")
     if max_diff < 1e-4:
         print(f"  ✓ Outputs match (max diff < 1e-4)")
     else:
@@ -289,6 +365,11 @@ def main():
         "onnx_model": str(output_path),
         "opset": args.opset,
         "stateful": stateful,
+        # ✅2026-09-17: 记录图里**是否含** internal_norm —— 部署侧据此决定要不要在图外做
+        #   归一化。含的话统计量跟着 batch 走（训练 512 窗/批 vs 流式 1 窗/批）；
+        #   不含的话必须在图外用固定参数补上（见 fit_internal_norm_baseline.py）。
+        "internal_norm": internal_norm,
+        "missing_mode": missing_mode,
         "input_shape": (["batch_size", input_size] if stateful
                         else ["batch_size", seq_len, input_size]),
         "output_shape": ["batch_size", num_classes],
