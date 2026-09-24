@@ -251,6 +251,15 @@ def remove_outliers(peak_times: np.ndarray) -> tuple:
       1. **生理范围**: 相邻间隔须在 `[MIN_RR_S, MAX_RR_S]` —— 只看相邻两拍, 天然因果
       2. **统计离群**: 间隔偏离**尾部滚动**中位数超过 `MAD_K × 1.4826 × MAD`
 
+    ⚠️ **两条规则都只在「间期偏短」方向删拍, 偏长方向不删**（2026-09-24 修,
+       与 `beat_detection._remove_outliers` 同步）:
+
+      - **偏短 = 假峰**。假峰 X 夹在真峰 P、Q 之间时必出现过短间期; 删掉 X 后
+        P、Q 相邻, 合并出的间期正好是它们之间的**真实时间** —— 删短是对的。
+      - **偏长 = 漏检**。中间少了一拍, **两个峰都是真的**, 没有假峰可删。删掉一个
+        真峰只会让合并后的跨度更大; 而 `keep` 是一次性算在原始 `rr` 上的, 新形成的
+        更长间期不会再被复查 —— 等于把「超过 2 s」**放大**成更大的值。
+
     ⚠️ 规则 2 的统计量必须用滚动窗口而非整段: 整夜 median/MAD 会让同一段前缀
        「单独跑」与「接上后续数据跑」保留的拍不同, 流式无法复现离线。
 
@@ -262,12 +271,13 @@ def remove_outliers(peak_times: np.ndarray) -> tuple:
         return peak_times, 0
     rr = np.diff(peak_times)
     keep = np.ones(len(peak_times), dtype=bool)
-    bad = (rr < MIN_RR_S) | (rr > MAX_RR_S)
-    keep[1:][bad] = False
+
+    # 偏短 = 假峰 → 删。偏长 = 漏检 → 不删（见 docstring）。
+    keep[1:][rr < MIN_RR_S] = False
 
     med, mad = rolling_median_mad_causal(rr, OUTLIER_WINDOW_BEATS)
     ok = mad > 1e-9
-    keep[1:][ok & (np.abs(rr - med) > MAD_K * MAD_SCALE * mad)] = False
+    keep[1:][ok & (rr < med - MAD_K * MAD_SCALE * mad)] = False
     return peak_times[keep], int((~keep).sum())
 
 

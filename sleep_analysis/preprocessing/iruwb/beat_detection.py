@@ -291,6 +291,19 @@ def _remove_outliers(peak_times: np.ndarray, mad_k: float = 3.0,
          本身就是因果的。
       2. **统计离群**: 间隔偏离中位数超过 ``mad_k`` 倍 MAD（1.4826 缩放到 σ 口径）。
 
+    ⚠️ **两条规则都只在「间期偏短」方向删拍, 偏长方向不删。** 理由:
+
+      - **偏短 = 假峰**。假峰 X 夹在真峰 P、Q 之间时, ``(P,X)`` 或 ``(X,Q)`` 必
+        出现过短间期; 删掉 X 后 P、Q 相邻, 合并出的间期**正好是它们之间的真实
+        时间** —— 所以删短是对的。
+      - **偏长 = 漏检**。中间少了一拍, **两个峰都是真的**, 没有假峰可删。删掉一个
+        真峰只会让合并后的跨度更大; 而且 ``keep`` 是**一次性**算在原始 ``rr`` 上的,
+        新形成的更长间期不会再被复查 —— 等于把「超过 2 s」的问题**放大**成更大的值。
+
+    2026-09-24 修: 此前两条规则都用双向判据（``rr > MAX_RR_S`` 与 ``np.abs(...)``）
+    触发删拍, 在漏检情形下会删真峰并放大跨度。**修复会改变特征值, 需要重新生成
+    特征表并重训。**
+
     ⚠️ **规则 2 的统计量必须随 ``causal`` 分支**, 否则流式推理无法复现离线特征:
     同一段前缀信号「单独跑」与「接上后续数据跑」, 保留的拍会不一样 ——
     因为整夜的 median/MAD 会随后续数据变化。
@@ -316,20 +329,24 @@ def _remove_outliers(peak_times: np.ndarray, mad_k: float = 3.0,
         return peak_times, 0
     rr = np.diff(peak_times)
     keep = np.ones(len(peak_times), dtype=bool)
-    bad = (rr < MIN_RR_S) | (rr > MAX_RR_S)
-    keep[1:][bad] = False
+
+    # 偏短 = 假峰 → 删（见 docstring）。偏长 = 漏检 → 不删。
+    too_short = rr < MIN_RR_S
+    keep[1:][too_short] = False
+    # `bad`（双向）只用于非因果分支里给稳健统计量预筛, 不用于删拍。
+    bad = too_short | (rr > MAX_RR_S)
 
     if causal:
         med, mad = _rolling_median_mad(rr, OUTLIER_WINDOW_BEATS)
         ok = mad > 1e-9
-        keep[1:][ok & (np.abs(rr - med) > mad_k * 1.4826 * mad)] = False
+        keep[1:][ok & (rr < med - mad_k * 1.4826 * mad)] = False
     else:
         good_rr = rr[~bad]
         if len(good_rr) >= 5:
             med = np.median(good_rr)
             mad = np.median(np.abs(good_rr - med))
             if mad > 1e-9:
-                keep[1:][np.abs(rr - med) > mad_k * 1.4826 * mad] = False
+                keep[1:][rr < med - mad_k * 1.4826 * mad] = False
     return peak_times[keep], int((~keep).sum())
 
 
