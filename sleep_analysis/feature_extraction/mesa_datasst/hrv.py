@@ -57,11 +57,28 @@ def calc_hrv_features(df_hr: pd.DataFrame):
     :param df_hr: pd.DataFrame that contains RR-intervals
     :returns: pd.DataFrame that contains all HRV features
     """
+    # ✅2026-09-24: 排除**插值补出来的拍** —— 线性插值补出的段是等差数列，
+    #   会让 SDSD≈0 → SD1=sqrt(SDSD²/2)≈0 → ratio_sd2_sd1 = SD2/SD1 发散
+    #   （实测 1e13~1e15，把 StandardScaler 的 mean/std 拉到 8.2e9/4.8e12，
+    #   该特征在模型里恒为常数）。频域 4 个槽位同样受污染（实测偏 12~35%）。
+    #   掩码由 preprocessing/rr_utils.py::process_rpoint 写入。
+    if "interpolated" not in df_hr.columns:
+        raise KeyError(
+            "输入缺少 `interpolated` 列 —— 这是 2026-09-24 之前产出的旧 ecg_data_clean，"
+            "其中插值补出来的心搏会被当成真实测量参与 HRV 计算，导致 ratio_sd2_sd1 "
+            "出现 1e13~1e15 的伪值。请用新代码重新生成预处理数据"
+            "（见 preprocessing/rr_utils.py::process_rpoint）。")
+
     hr_epoch_set = set(df_hr["epoch"].values)
 
     all_hr_features = {}
     for i, hr_epoch_idx in enumerate(list(hr_epoch_set)):
         tmp_hr_df = df_hr[df_hr["epoch"] == hr_epoch_idx]
+        tmp_hr_df = tmp_hr_df[tmp_hr_df["interpolated"] == 0]
+        # ⚠️ 下面 `tmp_hr_df.size > 3` 是个**失效的门槛**：tmp_hr_df 有 20+ 列，
+        #    `.size` = 行数 × 列数，等价于「至少有 1 行」。真正保证拍数够的是上游
+        #    rr_utils 的 `MIN_REAL_RR_PER_EPOCH=10` 整 epoch 剔除。
+        #    保留原样不改（改它会变更语义），但别再以为这里卡了拍数。
         if tmp_hr_df.size > 3:
             rr_epoch = tmp_hr_df["RR Intervals"].values
 
